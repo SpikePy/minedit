@@ -2,14 +2,6 @@
 
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*};
 
-// Colors are 0x00BBGGRR.
-const STRIP: u32 = 0xF3F3F3;
-const HOVER: u32 = 0xE5E5E5;
-const TAB_HOVER: u32 = 0xEAEAEA;
-const SEPARATOR: u32 = 0xD5D5D5;
-const CLOSE_RED: u32 = 0x1C2BC4; // #C42B1C
-const INACTIVE_TEXT: u32 = 0x8A8A8A;
-
 // Glyphs from Segoe Fluent Icons / Segoe MDL2 Assets.
 const GLYPH_CLOSE: &str = "\u{E8BB}";
 const GLYPH_ADD: &str = "\u{E710}";
@@ -33,6 +25,8 @@ pub enum Hit {
 
 pub struct Rects {
     pub height: i32,
+    pub clip: RECT,       // visible tab area; tabs scrolled out of it are hidden
+    pub max_scroll: i32,  // how far the tabs can scroll when they do not fit
     pub tabs: Vec<RECT>,
     pub closes: Vec<RECT>,
     pub new_tab: RECT,
@@ -65,8 +59,9 @@ fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
-/// Positions of everything in the bar for a window `width` pixels wide with `n` tabs.
-pub fn layout(width: i32, dpi: u32, n: usize) -> Rects {
+/// Positions of everything in the bar for a window `width` pixels wide with `n` tabs,
+/// scrolled `scroll` pixels to the left when they do not fit.
+pub fn layout(width: i32, dpi: u32, n: usize, scroll: i32) -> Rects {
     let p = |v| px(v, dpi);
     let (h, bw) = (p(32), p(46));
     let close = rect(width - bw, 0, width, h);
@@ -75,16 +70,19 @@ pub fn layout(width: i32, dpi: u32, n: usize) -> Rects {
     let menu = rect(min.left - bw, 0, min.left, h);
     let (x0, top, plus) = (p(8), p(4), p(32));
     // Tabs share the space, leaving some empty title bar to drag the window by.
-    let avail = menu.left - x0 - plus - p(40);
+    let avail = (menu.left - x0 - plus - p(40)).max(p(60));
     let tw = (avail / n.max(1) as i32).clamp(p(60), p(200));
-    let tabs: Vec<RECT> = (0..n as i32).map(|i| rect(x0 + i * tw, top, x0 + (i + 1) * tw, h)).collect();
+    let max_scroll = (n as i32 * tw - avail).max(0);
+    let sx = scroll.clamp(0, max_scroll);
+    let tabs: Vec<RECT> = (0..n as i32).map(|i| rect(x0 + i * tw - sx, top, x0 + (i + 1) * tw - sx, h)).collect();
     let cs = p(20);
     let closes = tabs.iter().map(|t| {
         let y = (t.top + t.bottom - cs) / 2;
         rect(t.right - p(6) - cs, y, t.right - p(6), y + cs)
     }).collect();
-    let nx = (x0 + n as i32 * tw + p(4)).min(menu.left - plus);
-    Rects { height: h, tabs, closes, new_tab: rect(nx, top + p(2), nx + plus, h - p(2)), menu, min, max, close }
+    let nx = (x0 + n as i32 * tw - sx).min(x0 + avail) + p(4);
+    let clip = rect(x0, 0, x0 + avail.min(n as i32 * tw), h);
+    Rects { height: h, clip, max_scroll, tabs, closes, new_tab: rect(nx, top + p(2), nx + plus, h - p(2)), menu, min, max, close }
 }
 
 pub fn hit(r: &Rects, x: i32, y: i32) -> Hit {
@@ -96,16 +94,16 @@ pub fn hit(r: &Rects, x: i32, y: i32) -> Hit {
             return h;
         }
     }
-    if x < r.menu.left {
+    if inside(&r.clip, x, y) {
         if let Some(i) = r.closes.iter().position(|c| inside(c, x, y)) {
             return Hit::TabClose(i);
         }
         if let Some(i) = r.tabs.iter().position(|t| inside(t, x, y)) {
             return Hit::Tab(i);
         }
-        if inside(&r.new_tab, x, y) {
-            return Hit::NewTab;
-        }
+    }
+    if inside(&r.new_tab, x, y) {
+        return Hit::NewTab;
     }
     Hit::Caption
 }
@@ -137,43 +135,44 @@ unsafe fn text(dc: HDC, font: HFONT, s: &str, r: &RECT, color: u32, flags: DRAW_
 /// Draws the bar into `dc`. `tabs` holds each tab's label and modified state.
 pub unsafe fn paint(dc: HDC, width: i32, r: &Rects, tabs: &[(String, bool)], cur: usize, l: &Look) {
     let p = |v| px(v, l.dpi);
-    let fg = if l.active { GetSysColor(COLOR_WINDOWTEXT) } else { INACTIVE_TEXT };
-    fill(dc, &rect(0, 0, width, r.height), STRIP);
+    let c = crate::theme::palette();
+    let fg = if l.active { c.fg } else { c.inactive_text };
+    fill(dc, &rect(0, 0, width, r.height), c.strip);
     SetBkMode(dc, TRANSPARENT as _);
-    // Tabs that do not fit disappear under the menu button.
+    // Tabs scrolled out of view are clipped.
     SaveDC(dc);
-    IntersectClipRect(dc, 0, 0, r.menu.left, r.height);
+    IntersectClipRect(dc, r.clip.left, 0, r.clip.right, r.height);
     for (i, ((label, dirty), t)) in tabs.iter().zip(&r.tabs).enumerate() {
         let hovered = matches!(l.hover, Hit::Tab(j) | Hit::TabClose(j) if j == i);
         if i == cur {
-            tab_shape(dc, t, GetSysColor(COLOR_WINDOW), p(6));
+            tab_shape(dc, t, c.bg, p(6));
         } else if hovered {
-            tab_shape(dc, &rect(t.left + p(2), t.top + p(2), t.right - p(2), t.bottom - p(3)), TAB_HOVER, p(4));
+            tab_shape(dc, &rect(t.left + p(2), t.top + p(2), t.right - p(2), t.bottom - p(3)), c.tab_hover, p(4));
         } else if i + 1 != cur && i + 1 < tabs.len() {
-            fill(dc, &rect(t.right - 1, t.top + p(8), t.right, t.bottom - p(6)), SEPARATOR);
+            fill(dc, &rect(t.right - 1, t.top + p(8), t.right, t.bottom - p(6)), c.separator);
         }
-        let c = r.closes[i];
+        let x = r.closes[i];
         let show_close = i == cur || hovered;
-        let label_rect = rect(t.left + p(12), t.top, if show_close { c.left - p(2) } else { t.right - p(12) }, t.bottom);
+        let label_rect = rect(t.left + p(12), t.top, if show_close { x.left - p(2) } else { t.right - p(12) }, t.bottom);
         let label = if *dirty { format!("*{label}") } else { label.clone() };
         text(dc, l.font, &label, &label_rect, fg, DT_END_ELLIPSIS);
         if show_close {
             if l.hover == Hit::TabClose(i) {
-                tab_shape(dc, &rect(c.left, c.top, c.right, c.bottom - p(4)), HOVER, p(4));
+                tab_shape(dc, &rect(x.left, x.top, x.right, x.bottom - p(4)), c.hover, p(4));
             }
-            text(dc, l.small_icons, GLYPH_CLOSE, &c, fg, DT_CENTER);
+            text(dc, l.small_icons, GLYPH_CLOSE, &x, fg, DT_CENTER);
         }
     }
     RestoreDC(dc, -1);
     if l.hover == Hit::NewTab {
-        tab_shape(dc, &rect(r.new_tab.left, r.new_tab.top, r.new_tab.right, r.new_tab.bottom - p(4)), HOVER, p(4));
+        tab_shape(dc, &rect(r.new_tab.left, r.new_tab.top, r.new_tab.right, r.new_tab.bottom - p(4)), c.hover, p(4));
     }
     text(dc, l.icons, GLYPH_ADD, &r.new_tab, fg, DT_CENTER);
     let max_glyph = if l.maximized { GLYPH_RESTORE } else { GLYPH_MAX };
     for (rc, h, glyph) in [(&r.menu, Hit::Menu, GLYPH_MENU), (&r.min, Hit::Min, GLYPH_MIN), (&r.max, Hit::Max, max_glyph), (&r.close, Hit::Close, GLYPH_CLOSE)] {
         let hot = l.hover == h;
         if hot {
-            fill(dc, rc, if h == Hit::Close { CLOSE_RED } else { HOVER });
+            fill(dc, rc, if h == Hit::Close { c.close_red } else { c.hover });
         }
         text(dc, l.icons, glyph, rc, if hot && h == Hit::Close { 0xFFFFFF } else { fg }, DT_CENTER);
     }
@@ -187,7 +186,7 @@ mod tests {
     #[test]
     fn buttons_are_right_aligned_and_scale() {
         for dpi in [96, 144, 192] {
-            let r = layout(1000, dpi, 1);
+            let r = layout(1000, dpi, 1, 0);
             let bw = px(46, dpi);
             assert_eq!((r.close.right, r.close.left), (1000, 1000 - bw));
             assert_eq!((r.max.right, r.min.right, r.menu.right), (r.close.left, r.max.left, r.min.left));
@@ -197,18 +196,30 @@ mod tests {
 
     #[test]
     fn tab_widths_clamp_and_shrink() {
-        let w = |n| { let r = layout(1200, 96, n); r.tabs[0].right - r.tabs[0].left };
+        let w = |n| { let r = layout(1200, 96, n, 0); r.tabs[0].right - r.tabs[0].left };
         assert_eq!(w(1), 200);
         assert!(w(5) < 200 && w(5) > 60);
         assert_eq!(w(50), 60);
-        let r = layout(1200, 96, 3);
+        let r = layout(1200, 96, 3, 0);
         assert!(r.tabs.windows(2).all(|t| t[0].right == t[1].left));
         assert!(r.new_tab.left >= r.tabs[2].right);
     }
 
     #[test]
+    fn tabs_scroll_when_they_do_not_fit() {
+        let r = layout(1000, 96, 30, 0);
+        assert!(r.max_scroll > 0);
+        assert_eq!(r.tabs[0].left, r.clip.left);
+        let s = layout(1000, 96, 30, 100_000); // clamped to the end
+        assert_eq!(s.tabs[29].right, s.clip.right);
+        assert!(s.new_tab.left >= s.clip.right);
+        assert_eq!(hit(&s, s.clip.left + 2, 30), Hit::Tab(29 - (s.clip.right - s.clip.left) as usize / 60));
+        assert_eq!(layout(1000, 96, 3, 50).max_scroll, 0); // fits: no scrolling
+    }
+
+    #[test]
     fn hit_testing() {
-        let r = layout(1000, 96, 2);
+        let r = layout(1000, 96, 2, 0);
         let mid = |rc: &RECT| ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
         let at = |rc: &RECT| { let (x, y) = mid(rc); hit(&r, x, y) };
         assert_eq!(at(&r.close), Hit::Close);
@@ -239,8 +250,12 @@ mod tests {
                 (0, true, true, Hit::Close),
                 (1, false, false, Hit::TabClose(1)),
                 (0, true, false, Hit::Menu),
+                (1, true, false, Hit::Tab(2)), // the same again in dark
+                (0, true, true, Hit::Close),
+                (1, false, false, Hit::TabClose(1)),
+                (0, true, false, Hit::Menu),
             ];
-            let bh = layout(w, dpi, 3).height;
+            let bh = layout(w, dpi, 3, 0).height;
             let h = bh * states.len() as i32 + 8 * (states.len() as i32 - 1);
             let dc = CreateCompatibleDC(null_mut());
             let mut bits = null_mut();
@@ -250,8 +265,9 @@ mod tests {
             SelectObject(dc, bmp);
             fill(dc, &rect(0, 0, w, h), 0x808080);
             for (k, &(cur, active, maximized, hover)) in states.iter().enumerate() {
-                let n = if k == 3 { 1 } else { 3 };
-                let r = layout(w, dpi, n);
+                crate::theme::set_dark(k >= 4);
+                let n = if k % 4 == 3 { 1 } else { 3 };
+                let r = layout(w, dpi, n, 0);
                 let look = Look {
                     font: font("Segoe UI", 15), icons: font("Segoe Fluent Icons", 12), small_icons: font("Segoe Fluent Icons", 10),
                     dpi, active, maximized, hover,

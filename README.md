@@ -10,39 +10,58 @@ the plain Win32 API: one ~400 KB `.exe`, no runtime, no DLLs to install.
 
 ## Features
 
-- **Tabs in the title bar**, like Windows 11 Notepad or a browser
-- **Restores everything** on start: open tabs, unsaved text, window size
-  and position; closing never asks to save
-- **Multi-cursor editing**: Alt+click adds a cursor
+- **Tabs in the title bar**, like Windows 11 Notepad or a browser: drag to
+  reorder, drag out into a new window or onto another window, right-click for
+  more; the tab bar scrolls when it is full
+- **Restores everything** on start: all windows, open tabs, unsaved text,
+  window sizes and positions; closing never asks to save
+- **Multi-cursor editing**: Alt+click adds a cursor, Alt+drag selects a
+  column, Ctrl+D adds the next match
+- Line commands (duplicate, delete, move), auto-closing brackets and quotes,
+  matching-bracket highlight, go to line
 - **Unlimited undo/redo**
-- **Syntax highlighting** for YAML, JSON, CSV, Markdown, INI and XML
+- **Syntax highlighting** for YAML, JSON, CSV, Markdown, INI, TOML, XML,
+  Bash, PowerShell, Python and JavaScript/TypeScript
 - **Word wrap**, line numbers, current-line highlight, configurable margin
+- **Light and dark theme**, following Windows by default
 - **Find and replace** with a match counter
 - **Detects files changed by other programs** and reloads them
 - Keeps each file's encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI)
   and line endings (CRLF/LF)
-- Status bar with line/column, word wrap state and language
+- Status bar with line/column, word wrap, encoding, line endings and
+  language — click any of them to change it
+- **One window**: files opened from Explorer while minedit runs open as tabs;
+  "Open with" and "Edit with minedit" entries are added by the installer
 - Settings in a plain `settings.ini`, edited in a tab
 
 ## Keyboard shortcuts
+
+Press **Ctrl+/** in minedit for an overview of all shortcuts.
 
 | Keys | Action |
 |---|---|
 | Ctrl+T / Ctrl+N | New tab |
 | Ctrl+O | Open |
+| Ctrl+P | Quick open: fuzzy search open and recent files |
 | Ctrl+S / Ctrl+Shift+S | Save / Save As |
 | Ctrl+W, middle-click a tab | Close tab |
 | Ctrl+Shift+T | Reopen closed tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Alt+1 … Alt+9 | Go to tab 1–9 |
 | Alt | Open the menu |
-| Alt+click | Add or remove a cursor |
+| Alt+click / Alt+drag | Add or remove a cursor / column selection |
+| Alt+Shift+↑ / Alt+Shift+↓ | Add a cursor above / below |
+| Ctrl+D | Select word, then add the next match |
+| Ctrl+Shift+D / Ctrl+Shift+K | Duplicate / delete line |
+| Alt+↑ / Alt+↓ | Move line up / down |
+| Ctrl+G | Go to line |
+| Ctrl+B / Ctrl+I | Bold / italic (Markdown) |
 | Esc | Back to a single cursor |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Tab / Shift+Tab | Indent / unindent selected lines |
 | Ctrl+F / F3 / Ctrl+H | Find / find next / replace |
 | Alt+Z | Toggle word wrap |
-| Ctrl+mouse wheel | Font size |
+| Ctrl+mouse wheel / Ctrl+0 | Font size / reset font size |
 
 ## Settings
 
@@ -58,6 +77,9 @@ line_numbers = true
 highlight_line = true
 margin = 8
 word_wrap = false
+auto_close = true
+theme = system   # system, light or dark
+recent_files = 20
 ```
 
 ## Building

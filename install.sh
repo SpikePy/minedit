@@ -23,6 +23,19 @@ $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environ
 $lnk.TargetPath = $exe
 $lnk.WorkingDirectory = $dir
 $lnk.Save()
+# Explorer integration for this user: "Open with" for every file type and an "Edit with minedit" entry.
+$open = "`"$exe`" `"%1`""
+$reg = [Microsoft.Win32.Registry]::CurrentUser
+function Set-Key($path, $values) {
+    $k = $reg.CreateSubKey($path)
+    $values.GetEnumerator() | ForEach-Object { $k.SetValue($_.Key, $_.Value) }
+    $k.Close()
+}
+Set-Key "Software\Classes\Applications\minedit.exe" @{ FriendlyAppName = "minedit" }
+Set-Key "Software\Classes\Applications\minedit.exe\shell\open\command" @{ "" = $open }
+Set-Key "Software\Classes\*\OpenWithList\minedit.exe" @{}
+Set-Key "Software\Classes\*\shell\minedit" @{ "" = "Edit with minedit"; Icon = "`"$exe`"" }
+Set-Key "Software\Classes\*\shell\minedit\command" @{ "" = $open }
 "installed $exe"
 if ($running.Count -gt 0) {
     if ($closed) { Start-Process $exe -WorkingDirectory $dir; "restarted minedit" }

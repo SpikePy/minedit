@@ -19,19 +19,21 @@ const TAB: u16 = b'\t' as u16;
 const SP: u16 = b' ' as u16;
 const PAD: i32 = 4; // inside the line-number gutter
 const CF_UNICODETEXT: u32 = 13;
+/// Lines between syntax context checkpoints.
+const MARK: usize = 512;
 /// Posted to an editor to resync its scrollbars after a size or font change.
 pub const UPDATE: u32 = WM_APP;
 /// Posted to the parent when the main caret moved; lParam is the editor.
 pub const CARET: u32 = WM_APP + 1;
-const SEL_COLOR: u32 = 0xFFD6AD; // light blue (0x00BBGGRR)
-const SEL_COLOR_INACTIVE: u32 = 0xE5E5E5;
-const LINE_COLOR: u32 = 0xF2F2F2; // current line
-const GUTTER_COLOR: u32 = 0xF8F8F8;
+/// Auto-closed pairs.
+const PAIRS: [(u16, u16); 6] = [(b'(' as u16, b')' as u16), (b'[' as u16, b']' as u16), (b'{' as u16, b'}' as u16),
+    (b'"' as u16, b'"' as u16), (b'\'' as u16, b'\'' as u16), (b'`' as u16, b'`' as u16)];
 
 /// Font and tab settings shared by all editors.
 #[derive(Clone, Copy)]
 struct View {
     font: HFONT,
+    styled: [HFONT; 3], // bold, italic and bold italic versions of `font`, owned by the view
     dc: HDC, // memory DC with the font selected, for measuring
     lh: i32, // line height
     space: i32,
@@ -42,12 +44,13 @@ struct View {
     highlight_line: bool,
     margin: i32,
     wrap: bool,
+    auto_close: bool,
 }
 
 thread_local! {
     static VIEW: Cell<View> = const { Cell::new(View {
-        font: null_mut(), dc: null_mut(), lh: 16, space: 8, digit: 8, tab_width: 4, use_spaces: false,
-        line_numbers: true, highlight_line: true, margin: 8, wrap: false,
+        font: null_mut(), styled: [null_mut(); 3], dc: null_mut(), lh: 16, space: 8, digit: 8, tab_width: 4, use_spaces: false,
+        line_numbers: true, highlight_line: true, margin: 8, wrap: false, auto_close: true,
     }) };
 }
 
@@ -64,6 +67,7 @@ pub struct Options {
     pub highlight_line: bool,
     pub margin: i32, // pixels around the text
     pub word_wrap: bool,
+    pub auto_close: bool, // brackets and quotes
 }
 
 pub unsafe fn set_view(font: HFONT, o: &Options) {
@@ -77,10 +81,23 @@ pub unsafe fn set_view(font: HFONT, o: &Options) {
     let mut sz: SIZE = zeroed();
     GetTextExtentPoint32W(v.dc, w!(" "), 1, &mut sz);
     (v.font, v.lh, v.space) = (font, tm.tmHeight.max(1), sz.cx.max(1));
+    // Bold / italic variants for Markdown emphasis and headings.
+    let mut lf: LOGFONTW = zeroed();
+    GetObjectW(font, size_of::<LOGFONTW>() as i32, &mut lf as *mut _ as _);
+    for (k, (bold, italic)) in [(true, false), (false, true), (true, true)].into_iter().enumerate() {
+        if !v.styled[k].is_null() {
+            DeleteObject(v.styled[k]);
+        }
+        let mut f = lf;
+        f.lfWeight = if bold { FW_BOLD as i32 } else { lf.lfWeight };
+        f.lfItalic = italic as u8;
+        v.styled[k] = CreateFontIndirectW(&f);
+    }
     GetTextExtentPoint32W(v.dc, w!("0"), 1, &mut sz);
     v.digit = sz.cx.max(1);
     (v.tab_width, v.use_spaces) = (o.tab_width.max(1), o.use_spaces);
     (v.line_numbers, v.highlight_line, v.margin, v.wrap) = (o.line_numbers, o.highlight_line, o.margin.max(0), o.word_wrap);
+    v.auto_close = o.auto_close;
     VIEW.with(|c| c.set(v));
 }
 
@@ -186,6 +203,15 @@ struct Step {
     typing: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum Command {
+    SelectNext,
+    DuplicateLines,
+    DeleteLines,
+    MoveUp,
+    MoveDown,
+}
+
 pub struct Editor {
     h: HWND,
     pub text: Vec<u16>,
@@ -203,9 +229,29 @@ pub struct Editor {
     wheel: i32,
     drag: bool,
     alt_click: bool, // swallow the Alt release so Alt+click does not open the menu
+    column: Option<((usize, usize), i32, usize)>, // Alt+drag: anchor row, x and the clicked position
     focus: bool,
     lang: Lang,
+    marks: Vec<syntax::Ctx>, // syntax context at the start of every MARK-th line, while still valid
     blink: bool,
+}
+
+/// Puts text on the clipboard; returns false if the clipboard is busy.
+pub unsafe fn set_clipboard(owner: HWND, t: &[u16]) -> bool {
+    if OpenClipboard(owner) == 0 {
+        return false;
+    }
+    EmptyClipboard();
+    let g = GlobalAlloc(GMEM_MOVEABLE, (t.len() + 1) * 2);
+    let p = GlobalLock(g) as *mut u16;
+    if !p.is_null() {
+        p.copy_from_nonoverlapping(t.as_ptr(), t.len());
+        *p.add(t.len()) = 0;
+        GlobalUnlock(g);
+        SetClipboardData(CF_UNICODETEXT, g);
+    }
+    CloseClipboard();
+    true
 }
 
 pub unsafe fn ed<'a>(h: HWND) -> &'a mut Editor {
@@ -229,7 +275,7 @@ pub unsafe fn create(parent: HWND) -> HWND {
         0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
     let e = Box::new(Editor {
         h, text: Vec::new(), lines: vec![0], sels: vec![Sel::at(0)], main: 0, undo: Vec::new(), redo: Vec::new(),
-        saved: Some(0), merge: false, top: 0, top_sub: 0, sx: 0, wmax: 0, wheel: 0, drag: false, alt_click: false, focus: false, lang: Lang::Plain, blink: true,
+        saved: Some(0), merge: false, top: 0, top_sub: 0, sx: 0, wmax: 0, wheel: 0, drag: false, alt_click: false, column: None, focus: false, lang: Lang::Plain, marks: Vec::new(), blink: true,
     });
     SetWindowLongPtrW(h, GWLP_USERDATA, Box::into_raw(e) as isize);
     h
@@ -250,6 +296,7 @@ impl Editor {
 
     pub unsafe fn set_lang(&mut self, lang: Lang) {
         self.lang = lang;
+        self.marks.clear();
         InvalidateRect(self.h, null(), 0);
     }
 
@@ -266,6 +313,7 @@ impl Editor {
     pub unsafe fn set_text(&mut self, t: Vec<u16>) {
         self.text = t;
         self.reindex();
+        self.marks.clear();
         (self.sels, self.main, self.top, self.top_sub, self.sx, self.wmax) = (vec![Sel::at(0)], 0, 0, 0, 0, 0);
         self.undo.clear();
         self.redo.clear();
@@ -287,6 +335,41 @@ impl Editor {
     pub unsafe fn replace(&mut self, r: Range<usize>, t: Vec<u16>) {
         (self.sels, self.main) = (vec![Sel { a: r.start, h: r.end, x: -1 }], 0);
         self.change(vec![(r, t)], true, false);
+    }
+
+    /// Replaces `text[at..at + del]` with `ins`, updating the line index in place (no full rescan);
+    /// returns the removed text.
+    fn splice(&mut self, at: usize, del: usize, ins: &[u16]) -> Vec<u16> {
+        // Syntax context checkpoints after the changed line are no longer valid.
+        let line = self.line_of(at);
+        self.marks.truncate(if line == 0 { 0 } else { line / MARK + 1 });
+        let removed = self.text.splice(at..at + del, ins.iter().copied()).collect();
+        let first = self.lines.partition_point(|&s| s <= at);
+        let last = self.lines.partition_point(|&s| s <= at + del);
+        let new: Vec<usize> = ins.iter().enumerate().filter(|(_, &c)| c == NL).map(|(i, _)| at + i + 1).collect();
+        let n = new.len();
+        self.lines.splice(first..last, new);
+        let d = ins.len() as isize - del as isize;
+        for s in &mut self.lines[first + n..] {
+            *s = (*s as isize + d) as usize;
+        }
+        removed
+    }
+
+    /// Syntax context at the start of line `line`, continuing from the nearest checkpoint.
+    fn ctx_at(&mut self, line: usize) -> syntax::Ctx {
+        if self.marks.is_empty() {
+            self.marks.push(syntax::context(self.lang, (0..self.lines.len()).map(|l| &self.text[self.line(l)]), 0));
+        }
+        let k = (line / MARK).min(self.marks.len() - 1);
+        let mut ctx = self.marks[k];
+        for l in k * MARK..line {
+            syntax::advance(self.lang, &self.text[self.line(l)], &mut ctx);
+            if (l + 1) % MARK == 0 && (l + 1) / MARK == self.marks.len() {
+                self.marks.push(ctx);
+            }
+        }
+        ctx
     }
 
     fn reindex(&mut self) {
@@ -398,9 +481,7 @@ impl Editor {
     }
 
     unsafe fn pos_from(&self, x: i32, y: i32) -> usize {
-        let v = view();
-        let row = self.step((self.top, self.top_sub), (y - v.margin).div_euclid(v.lh) as isize).0;
-        self.pos_in_row(row, x - self.left_edge() + self.sx)
+        self.pos_in_row(self.row_at(y), x - self.left_edge() + self.sx)
     }
 
     /// Width of the line-number gutter.
@@ -521,13 +602,12 @@ impl Editor {
         let mut d = 0isize;
         for (r, ins) in edits {
             let at = (r.start as isize + d) as usize;
-            let del: Vec<u16> = self.text.splice(at..at + r.len(), ins.iter().copied()).collect();
+            let del = self.splice(at, r.len(), &ins);
             d += ins.len() as isize - del.len() as isize;
             ops.push(Op { at, del, ins });
         }
         self.sels = sels;
         self.normalize();
-        self.reindex();
         self.redo.clear();
         if self.saved.is_some_and(|s| s > self.undo.len()) {
             self.saved = None; // the saved state was only reachable by redo
@@ -553,7 +633,7 @@ impl Editor {
     unsafe fn undo(&mut self) {
         let Some(s) = self.undo.pop() else { return };
         for op in s.ops.iter().rev() {
-            self.text.splice(op.at..op.at + op.ins.len(), op.del.iter().copied());
+            self.splice(op.at, op.ins.len(), &op.del);
         }
         self.restore(s.before.clone());
         self.redo.push(s);
@@ -562,7 +642,7 @@ impl Editor {
     unsafe fn redo(&mut self) {
         let Some(s) = self.redo.pop() else { return };
         for op in &s.ops {
-            self.text.splice(op.at..op.at + op.del.len(), op.ins.iter().copied());
+            self.splice(op.at, op.del.len(), &op.ins);
         }
         self.restore(s.after.clone());
         self.undo.push(s);
@@ -570,7 +650,6 @@ impl Editor {
 
     unsafe fn restore(&mut self, sels: Vec<Sel>) {
         (self.main, self.sels, self.merge) = (sels.len() - 1, sels, false);
-        self.reindex();
         self.changed();
     }
 
@@ -586,6 +665,10 @@ impl Editor {
                 s.r()
             } else if fwd {
                 s.h..if word { self.word_right(s.h) } else { self.right(s.h) }
+            } else if !word && view().auto_close && s.h > 0
+                && PAIRS.iter().any(|&(o, c)| self.text[s.h - 1] == o && self.text.get(s.h) == Some(&c))
+            {
+                s.h - 1..s.h + 1 // empty auto-closed pair
             } else {
                 (if word { self.word_left(s.h) } else { self.left(s.h) })..s.h
             };
@@ -628,21 +711,7 @@ impl Editor {
 
     unsafe fn copy(&self) -> bool {
         let parts: Vec<&[u16]> = self.sels.iter().filter(|s| s.a != s.h).map(|s| &self.text[s.r()]).collect();
-        if parts.is_empty() || OpenClipboard(self.h) == 0 {
-            return false;
-        }
-        let t = to_crlf(&parts.join(&NL));
-        EmptyClipboard();
-        let g = GlobalAlloc(GMEM_MOVEABLE, (t.len() + 1) * 2);
-        let p = GlobalLock(g) as *mut u16;
-        if !p.is_null() {
-            p.copy_from_nonoverlapping(t.as_ptr(), t.len());
-            *p.add(t.len()) = 0;
-            GlobalUnlock(g);
-            SetClipboardData(CF_UNICODETEXT, g);
-        }
-        CloseClipboard();
-        true
+        !parts.is_empty() && set_clipboard(self.h, &to_crlf(&parts.join(&NL)))
     }
 
     unsafe fn paste(&mut self) {
@@ -701,6 +770,11 @@ impl Editor {
             VK_DELETE => self.delete(ctrl, true),
             VK_ESCAPE => self.select(self.sels[self.main].h, self.sels[self.main].h),
             _ if !ctrl => return false,
+            VK_B if self.lang == Lang::Markdown => self.toggle_marker("**"),
+            VK_I if self.lang == Lang::Markdown => self.toggle_marker("*"),
+            VK_D if shift => self.duplicate_lines(),
+            VK_D => self.select_next(),
+            VK_K if shift => self.delete_lines(),
             VK_Z if shift => self.redo(),
             VK_Z => self.undo(),
             VK_Y => self.redo(),
@@ -717,6 +791,15 @@ impl Editor {
     }
 
     unsafe fn char(&mut self, c: u16) {
+        self.typed(c, key(VK_CONTROL) && !key(VK_MENU));
+    }
+
+    /// A typed character. With Ctrl held (and not AltGr = Ctrl+Alt), Windows also sends control
+    /// characters for Ctrl+letter shortcuts: Ctrl+I is a Tab, Ctrl+M a line break. Those are ignored.
+    unsafe fn typed(&mut self, c: u16, ctrl: bool) {
+        if ctrl && c < 32 {
+            return;
+        }
         match c {
             CR => self.type_each(true, |e, s, _| {
                 // Keep the indentation of the current line.
@@ -726,14 +809,14 @@ impl Editor {
             }),
             TAB => self.tab(key(VK_SHIFT)),
             _ if c < 32 || c == 127 => {}
-            _ => self.type_each(true, |_, _, _| vec![c]),
+            _ => self.type_char(c),
         }
     }
 
     /// Click places the caret, Shift+click extends, Alt+click adds (or removes) a cursor.
     unsafe fn click(&mut self, x: i32, y: i32) {
         let p = self.pos_from(x, y);
-        self.drag = true;
+        (self.drag, self.column) = (true, None);
         if key(VK_MENU) {
             self.alt_click = true;
             match self.sels.iter().position(|s| s.a == p && s.h == p) {
@@ -744,6 +827,7 @@ impl Editor {
                 _ => {
                     self.sels.push(Sel::at(p));
                     self.main = self.sels.len() - 1;
+                    self.column = Some((self.row_at(y), x - self.left_edge() + self.sx, p));
                 }
             }
         } else if key(VK_SHIFT) {
@@ -757,13 +841,45 @@ impl Editor {
     }
 
     unsafe fn drag_to(&mut self, x: i32, y: i32) {
-        self.sels[self.main].h = self.pos_from(x, y);
+        match self.column {
+            // Alt+drag, once the mouse left the clicked character: one selection per row.
+            Some((row, ax, p)) if self.pos_from(x, y) != p => self.column_select(row, ax, self.row_at(y), x - self.left_edge() + self.sx),
+            Some(_) => {}
+            None => {
+                self.sels[self.main].h = self.pos_from(x, y);
+                self.normalize();
+                self.show();
+            }
+        }
+    }
+
+    /// Selects from x `x0` to `x1` on every screen row between `r0` and `r1`.
+    unsafe fn column_select(&mut self, r0: (usize, usize), x0: i32, r1: (usize, usize), x1: i32) {
+        let (mut row, end) = (r0.min(r1), r0.max(r1));
+        let mut sels = Vec::new();
+        loop {
+            sels.push(Sel { a: self.pos_in_row(row, x0), h: self.pos_in_row(row, x1), x: x1 });
+            let (next, moved) = self.step(row, 1);
+            if row == end || moved == 0 {
+                break;
+            }
+            row = next;
+        }
+        if r1 < r0 {
+            sels.reverse(); // the main cursor follows the mouse
+        }
+        (self.main, self.sels) = (sels.len() - 1, sels);
         self.normalize();
         self.show();
     }
 
-    unsafe fn select_word(&mut self, x: i32, y: i32) {
-        let p = self.pos_from(x, y);
+    unsafe fn row_at(&self, y: i32) -> (usize, usize) {
+        let v = view();
+        self.step((self.top, self.top_sub), (y - v.margin).div_euclid(v.lh) as isize).0
+    }
+
+    /// The word (or run of punctuation) around `p`.
+    fn word_at(&self, p: usize) -> (usize, usize) {
         let n = self.text.len();
         let k = if p < n && self.text[p] != NL { class(self.text[p]) } else if p > 0 { class(self.text[p - 1]) } else { 3 };
         let (mut a, mut b) = (p, p);
@@ -773,7 +889,262 @@ impl Editor {
         while k != 3 && b < n && class(self.text[b]) == k {
             b += 1;
         }
-        self.sels[self.main] = Sel { a, h: b, x: -1 };
+        (a, b)
+    }
+
+    /// Ctrl+D: select the word at the caret, then add the next occurrence of the selection.
+    unsafe fn select_next(&mut self) {
+        let m = self.sels[self.main];
+        if m.a == m.h {
+            let (a, h) = self.word_at(m.h);
+            self.sels[self.main] = Sel { a, h, x: -1 };
+        } else {
+            let what = self.text[m.r()].to_vec();
+            let last = self.sels.iter().map(|s| s.r().end).max().unwrap_or(0);
+            let find = |from: usize, to: usize| (from..to).find(|&i| self.text[i..].starts_with(&what));
+            let Some(i) = find(last, self.text.len()).or_else(|| find(0, last)) else { return };
+            if self.sels.iter().any(|s| s.r().start == i) {
+                return; // every occurrence is selected
+            }
+            self.sels.push(Sel { a: i, h: i + what.len(), x: -1 });
+            self.main = self.sels.len() - 1;
+        }
+        self.merge = false;
+        self.normalize();
+        self.show();
+    }
+
+    /// Lines touched by the selections, as merged (first, last) blocks.
+    fn line_blocks(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for s in &self.sels {
+            let r = s.r();
+            let (a, mut b) = (self.line_of(r.start), self.line_of(r.end));
+            if b > a && self.lines[b] == r.end {
+                b -= 1; // selection ends at the start of a line: leave that line alone
+            }
+            match out.last_mut() {
+                Some(l) if a <= l.1 + 1 => l.1 = l.1.max(b),
+                _ => out.push((a, b)),
+            }
+        }
+        out
+    }
+
+    /// Text of lines a..=b without the final newline.
+    fn block(&self, (a, b): (usize, usize)) -> Range<usize> {
+        self.lines[a]..self.line(b).end
+    }
+
+    /// Ctrl+Shift+D: copies the selected lines below themselves; the cursors move to the copy.
+    unsafe fn duplicate_lines(&mut self) {
+        let edits = self.line_blocks().into_iter().map(|bl| {
+            let r = self.block(bl);
+            (r.start..r.start, self.text[r].iter().copied().chain(Some(NL)).collect())
+        }).collect();
+        self.change(edits, false, false);
+    }
+
+    /// Ctrl+Shift+K: removes the selected lines.
+    unsafe fn delete_lines(&mut self) {
+        let n = self.text.len();
+        let edits = self.line_blocks().into_iter().map(|(a, b)| {
+            let r = match self.lines.get(b + 1) {
+                Some(&next) => self.lines[a]..next,
+                None if a > 0 => self.lines[a] - 1..n, // last line: take the newline before it
+                None => 0..n,
+            };
+            (r, Vec::new())
+        }).collect();
+        self.change(edits, true, false);
+    }
+
+    /// Alt+Up/Down: swaps the selected lines with the line above or below.
+    pub unsafe fn move_lines(&mut self, down: bool) {
+        let blocks = self.line_blocks();
+        if blocks.is_empty() || (!down && blocks[0].0 == 0) || (down && blocks.last().unwrap().1 + 1 >= self.lines.len()) {
+            return;
+        }
+        let mut shifts = Vec::new(); // (block range, how far its selections move)
+        let edits = blocks.iter().map(|&(a, b)| {
+            let (block, other) = if down { (self.block((a, b)), self.block((b + 1, b + 1))) } else { (self.block((a, b)), self.block((a - 1, a - 1))) };
+            let (bt, ot) = (&self.text[block.clone()], &self.text[other.clone()]);
+            let (range, text): (Range<usize>, Vec<u16>) = if down {
+                (block.start..other.end, ot.iter().chain(&[NL]).chain(bt).copied().collect())
+            } else {
+                (other.start..block.end, bt.iter().chain(&[NL]).chain(ot).copied().collect())
+            };
+            let d = (ot.len() + 1) as isize;
+            shifts.push((self.lines[a]..block.end + 1, if down { d } else { -d }));
+            (range, text)
+        }).collect();
+        let sels: Vec<Sel> = self.sels.iter().map(|s| {
+            let d = shifts.iter().find(|(r, _)| r.contains(&s.r().start)).map_or(0, |x| x.1);
+            let m = |p: usize| (p as isize + d) as usize;
+            Sel { a: m(s.a), h: m(s.h), x: -1 }
+        }).collect();
+        self.change(edits, false, false);
+        self.set_after(sels);
+    }
+
+    /// Markdown Ctrl+B / Ctrl+I: puts `**` / `*` around each selection, or removes them if already there.
+    /// Without a selection the word at the caret is used; outside a word an empty pair is inserted.
+    unsafe fn toggle_marker(&mut self, m: &str) {
+        let mk: Vec<u16> = m.encode_utf16().collect();
+        let n = mk.len();
+        let star = b'*' as u16;
+        let stars_before = |p: usize| self.text[..p].iter().rev().take_while(|&&c| c == star).count();
+        let stars_after = |p: usize| self.text[p..].iter().take_while(|&&c| c == star).count();
+        // Already marked? Bold needs two stars on each side; italic an odd number (1, or 3 = bold italic).
+        let marked = |a: usize, b: usize| {
+            let (x, y) = (stars_before(a), stars_after(b));
+            if n == 2 { x >= 2 && y >= 2 } else { x % 2 == 1 && y % 2 == 1 }
+        };
+        let mut edits = Vec::new();
+        let mut sels = Vec::new();
+        let mut d = 0isize; // how much earlier edits moved the text
+        for s in &self.sels {
+            let r = if s.a == s.h {
+                let (a, b) = self.word_at(s.h);
+                if b > a && class(self.text[a]) == 1 { a..b } else { s.h..s.h }
+            } else {
+                s.r()
+            };
+            let at = |p: usize, shift: isize| (p as isize + d + shift) as usize;
+            if !r.is_empty() && marked(r.start, r.end) {
+                edits.push((r.start - n..r.start, Vec::new()));
+                edits.push((r.end..r.end + n, Vec::new()));
+                sels.push(Sel { a: at(r.start, -(n as isize)), h: at(r.end, -(n as isize)), x: -1 });
+                d -= 2 * n as isize;
+            } else if r.is_empty() {
+                edits.push((r.clone(), [mk.clone(), mk.clone()].concat()));
+                sels.push(Sel::at(at(r.start, n as isize)));
+                d += 2 * n as isize;
+            } else {
+                edits.push((r.start..r.start, mk.clone()));
+                edits.push((r.end..r.end, mk.clone()));
+                sels.push(Sel { a: at(r.start, n as isize), h: at(r.end, n as isize), x: -1 });
+                d += 2 * n as isize;
+            }
+        }
+        self.change(edits, false, false);
+        self.set_after(sels);
+    }
+
+    /// Alt+Shift+Up/Down: adds a cursor in the same column above the topmost / below the bottommost cursor.
+    pub unsafe fn add_cursor(&mut self, down: bool) {
+        let s = if down { self.sels[self.sels.len() - 1] } else { self.sels[0] }; // sels are sorted
+        let x = if s.x >= 0 { s.x } else { self.x_of(s.h) };
+        let (row, moved) = self.step(self.row_of(s.h), if down { 1 } else { -1 });
+        if moved == 0 {
+            return;
+        }
+        let p = self.pos_in_row(row, x);
+        self.sels.push(Sel { a: p, h: p, x });
+        self.main = self.sels.len() - 1;
+        self.merge = false;
+        self.normalize();
+        self.show();
+    }
+
+    /// Replaces the selections chosen by `change` (and recorded for redo) with `sels`.
+    unsafe fn set_after(&mut self, sels: Vec<Sel>) {
+        self.sels = sels;
+        self.normalize();
+        if let Some(step) = self.undo.last_mut() {
+            step.after = self.sels.clone();
+        }
+        self.show();
+    }
+
+    /// Typing with auto-close: pairs, wrapping selections and typing over closers.
+    unsafe fn type_char(&mut self, c: u16) {
+        let pair = PAIRS.iter().find(|p| p.0 == c || p.1 == c).copied().filter(|_| view().auto_close);
+        let Some((open, close)) = pair else { return self.type_each(true, |_, _, _| vec![c]) };
+        // Typing the closer that is already next just moves over it.
+        if c == close && self.sels.iter().all(|s| s.a == s.h && self.text.get(s.h) == Some(&c)) {
+            return self.move_to(false, |_, s| s.h + 1);
+        }
+        if c != open {
+            return self.type_each(true, |_, _, _| vec![c]);
+        }
+        let quote = open == close;
+        // 0 = plain, 1 = pair with caret inside, 2 = wrapped selection.
+        let kinds: Vec<(u8, usize)> = self.sels.iter().map(|s| {
+            let next_ok = self.text.get(s.h).is_none_or(|&n| n == SP || n == TAB || n == NL || b")]}".contains(&(n as u8)));
+            let prev_word = s.r().start > 0 && class(self.text[s.r().start - 1]) == 1;
+            if s.a != s.h { (2, s.r().len()) } else if next_ok && !(quote && prev_word) { (1, 0) } else { (0, 0) }
+        }).collect();
+        let edits = self.sels.iter().zip(&kinds).map(|(s, &(k, _))| {
+            let t = match k {
+                0 => vec![open],
+                1 => vec![open, close],
+                _ => [open].into_iter().chain(self.text[s.r()].iter().copied()).chain(Some(close)).collect(),
+            };
+            (s.r(), t)
+        }).collect();
+        self.change(edits, true, kinds.iter().all(|k| k.0 == 0));
+        if self.sels.len() == kinds.len() {
+            let sels = self.sels.iter().zip(&kinds).map(|(s, &(k, inner))| match k {
+                1 => Sel::at(s.h - 1),
+                2 => Sel { a: s.h - 1 - inner, h: s.h - 1, x: -1 },
+                _ => *s,
+            }).collect();
+            self.set_after(sels);
+        }
+    }
+
+    /// Position of the bracket next to the main caret and of its partner.
+    fn bracket_match(&self) -> Option<(usize, usize)> {
+        let h = self.sels[self.main].h;
+        let pairs = [(b'(' as u16, b')' as u16), (b'[' as u16, b']' as u16), (b'{' as u16, b'}' as u16)];
+        for q in [Some(h), h.checked_sub(1)].into_iter().flatten() {
+            let Some(&c) = self.text.get(q) else { continue };
+            let Some(&(o, cl)) = pairs.iter().find(|p| p.0 == c || p.1 == c) else { continue };
+            let mut depth = 0;
+            let range: Box<dyn Iterator<Item = usize>> = if c == o {
+                Box::new(q..self.text.len().min(q + 100_000))
+            } else {
+                Box::new((q.saturating_sub(100_000)..=q).rev())
+            };
+            for i in range {
+                let t = self.text[i];
+                depth += (t == c) as i32 - (t == if c == o { cl } else { o }) as i32;
+                if depth == 0 {
+                    return Some((q, i));
+                }
+            }
+        }
+        None
+    }
+
+    /// Moves the caret to a 1-based line and (visual) column.
+    pub unsafe fn go_to(&mut self, line: usize, col: usize) {
+        let l = line.clamp(1, self.lines.len()) - 1;
+        let r = self.line(l);
+        let tw = view().tab_width;
+        let (mut p, mut c) = (r.start, 0);
+        while p < r.end && c + 1 < col {
+            c = if self.text[p] == TAB { (c / tw + 1) * tw } else { c + 1 };
+            p += 1;
+        }
+        self.select(p, p);
+    }
+
+    /// Commands from the menu.
+    pub unsafe fn command(&mut self, cmd: Command) {
+        match cmd {
+            Command::SelectNext => self.select_next(),
+            Command::DuplicateLines => self.duplicate_lines(),
+            Command::DeleteLines => self.delete_lines(),
+            Command::MoveUp => self.move_lines(false),
+            Command::MoveDown => self.move_lines(true),
+        }
+    }
+
+    unsafe fn select_word(&mut self, x: i32, y: i32) {
+        let (a, h) = self.word_at(self.pos_from(x, y));
+        self.sels[self.main] = Sel { a, h, x: -1 };
         self.normalize();
         self.show();
     }
@@ -895,19 +1266,21 @@ impl Editor {
             FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, br);
             DeleteObject(br);
         };
-        fill(0, 0, w, hgt, GetSysColor(COLOR_WINDOW));
+        let c = crate::theme::palette();
+        fill(0, 0, w, hgt, c.bg);
         SelectObject(dc, v.font);
         SetBkMode(dc, TRANSPARENT as _);
-        let fg = GetSysColor(COLOR_WINDOWTEXT);
+        let fg = c.fg;
         SetTextColor(dc, fg);
         let (gutter, x0) = (self.gutter(), self.left_edge() - self.sx);
         let caret_lines: Vec<usize> = self.sels.iter().map(|s| self.line_of(s.h)).collect();
+        let brackets: Vec<usize> = if self.focus { self.bracket_match().map_or(Vec::new(), |(a, b)| vec![a, b]) } else { Vec::new() };
         let cw = (v.lh / 12).max(2);
         let wmax = self.wmax;
-        let sel_color = if self.focus { SEL_COLOR } else { SEL_COLOR_INACTIVE };
+        let sel_color = if self.focus { c.sel } else { c.sel_inactive };
         let mut numbers = Vec::new(); // (y, line) of each line's first row, for the gutter
         let (mut l, mut first_sub, mut y) = (self.top, self.top_sub, v.margin);
-        let mut ctx = syntax::context(self.lang, (0..self.lines.len()).map(|l| &self.text[self.line(l)]), l);
+        let mut ctx = self.ctx_at(l);
         while y < hgt && l < self.lines.len() {
             let r = self.line(l);
             let line = &self.text[r.clone()];
@@ -915,8 +1288,11 @@ impl Editor {
             let b = self.breaks(l, &xs);
             self.wmax = self.wmax.max(xs[line.len()]);
             let mut colors = vec![fg; line.len()];
+            let mut fonts = vec![0u8; line.len()];
             for (r, style) in syntax::line_spans(self.lang, line, &mut ctx) {
-                colors[r.start.min(line.len())..r.end.min(line.len())].fill(syntax::color(style));
+                let r = r.start.min(line.len())..r.end.min(line.len());
+                colors[r.clone()].fill(syntax::color(style));
+                fonts[r].fill(syntax::font_style(style));
             }
             for sub in first_sub..b.len() {
                 if y >= hgt {
@@ -929,7 +1305,10 @@ impl Editor {
                     numbers.push((y, l));
                 }
                 if v.highlight_line && caret_lines.contains(&l) {
-                    fill(0, y, w, y + v.lh, LINE_COLOR);
+                    fill(0, y, w, y + v.lh, c.line);
+                }
+                for q in brackets.iter().filter(|&&q| q >= ra && q < re) {
+                    fill(base + xs[q - r.start], y, base + xs[q - r.start + 1], y + v.lh, c.bracket);
                 }
                 for s in &self.sels {
                     let sr = s.r();
@@ -946,8 +1325,9 @@ impl Editor {
                         c += 1;
                         continue;
                     }
-                    let n = (c..e).take_while(|&k| line[k] != TAB && colors[k] == colors[c]).count();
+                    let n = (c..e).take_while(|&k| line[k] != TAB && colors[k] == colors[c] && fonts[k] == fonts[c]).count();
                     SetTextColor(dc, colors[c]);
+                    SelectObject(dc, if fonts[c] == 0 { v.font } else { v.styled[fonts[c] as usize - 1] });
                     TextOutW(dc, base + xs[c], y, line[c..].as_ptr(), n as i32);
                     c += n;
                 }
@@ -968,10 +1348,10 @@ impl Editor {
         }
         // The gutter is drawn last so horizontally scrolled text never shows through it.
         if gutter > 0 {
-            fill(0, 0, gutter, hgt, GUTTER_COLOR);
+            fill(0, 0, gutter, hgt, c.gutter_bg);
             SetTextAlign(dc, TA_RIGHT);
             for (y, l) in numbers {
-                SetTextColor(dc, if caret_lines.contains(&l) { fg } else { GetSysColor(COLOR_GRAYTEXT) });
+                SetTextColor(dc, if caret_lines.contains(&l) { fg } else { c.gutter_fg });
                 let n: Vec<u16> = (l + 1).to_string().encode_utf16().collect();
                 TextOutW(dc, gutter - 2 * PAD, y, n.as_ptr(), n.len() as i32);
             }
@@ -1024,7 +1404,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         WM_LBUTTONDBLCLK => (*p).select_word(x, y),
         WM_MOUSEMOVE if (*p).drag => (*p).drag_to(x, y),
         WM_LBUTTONUP => {
-            (*p).drag = false;
+            ((*p).drag, (*p).column) = (false, None);
             ReleaseCapture();
         }
         WM_MOUSEWHEEL => {
@@ -1071,6 +1451,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         }
         WM_CHAR => (*p).char(wp as u16),
         // A fresh Alt press clears the Alt+click flag; the release after an Alt+click is swallowed.
+        WM_SYSKEYDOWN if wp == VK_UP as usize || wp == VK_DOWN as usize => {
+            (*p).alt_click = true; // the Alt release must not open the menu
+            if key(VK_SHIFT) {
+                (*p).add_cursor(wp == VK_DOWN as usize);
+            } else {
+                (*p).move_lines(wp == VK_DOWN as usize);
+            }
+        }
         WM_SYSKEYDOWN if wp == VK_MENU as usize && lp & (1 << 30) == 0 => {
             (*p).alt_click = false;
             return DefWindowProcW(h, m, wp, lp);
@@ -1086,7 +1474,7 @@ mod tests {
     use super::*;
 
     fn opts(use_spaces: bool) -> Options {
-        Options { tab_width: 4, use_spaces, line_numbers: true, highlight_line: true, margin: 8, word_wrap: false }
+        Options { tab_width: 4, use_spaces, line_numbers: true, highlight_line: true, margin: 8, word_wrap: false, auto_close: true }
     }
 
     /// An editor inside a parent window that is never shown.
@@ -1249,12 +1637,17 @@ mod tests {
             ("json", Lang::Json, "{\n  \"name\": \"minedit\",\n  \"version\": 1.5,\n  \"tags\": [\"rust\", \"win32\"],\n  \"fast\": true,\n  \"deps\": null\n}"),
             ("yaml", Lang::Yaml, "# service config\n---\nserver:\n  host: \"0.0.0.0\" # all interfaces\n  port: 8080\n  debug: false\nitems:\n  - name: web\n    base: &base\n  - *base\n"),
             ("md", Lang::Markdown, "# Title\n\nSome *emphasis*, **bold**, `code` and a [link](http://x).\n\n- list item\n1. numbered\n> quote\n\n```rust\n# not a heading\nfn main() {}\n```\n---"),
+            ("py", Lang::Python, "import os\n\n@dataclass\nclass Item:\n    \"\"\"A thing\n    with docs.\"\"\"\n    def size(self, n=42):\n        return None if n < 0 else f'{n} items'  # count\n"),
+            ("js", Lang::JavaScript, "// math helpers\nexport async function sum(xs) {\n  /* add\n     all */\n  const t = xs.reduce((a, b) => a + b, 0);\n  return `total: ${t}`;\n}\n"),
+            ("ps1", Lang::PowerShell, "<# Cleans temp #>\nparam([string]$Path = $env:TEMP)\nforeach ($f in Get-ChildItem -Path $Path) {\n    if ($f.Length -gt 1MB) { Remove-Item $f -WhatIf }\n}\nWrite-Host 'done' # end\n"),
             ("xml", Lang::Xml, "<?xml version=\"1.0\"?>\n<!-- a comment\n     over two lines -->\n<root id=\"1\">\n  <item\n    name='a' enabled=\"true\">x &amp; y</item>\n  <empty/>\n</root>"),
         ];
-        for (ext, lang, text) in samples {
+        for (k, (ext, lang, text)) in samples.into_iter().enumerate() {
+            crate::theme::set_dark(k % 2 == 1); // alternate themes
             unsafe {
                 let e = editor(text);
                 e.set_lang(lang);
+                (e.focus, e.sels) = (true, vec![Sel::at(text.find('(').or(text.find('{')).unwrap_or(0))]);
                 let face: Vec<u16> = "Consolas".encode_utf16().chain(Some(0)).collect();
                 let font = CreateFontW(-18, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, CLEARTYPE_QUALITY as _, 0, face.as_ptr());
                 set_view(font, &Options { margin: 10, highlight_line: false, ..opts(false) });
@@ -1279,6 +1672,230 @@ mod tests {
                 f.extend(px);
                 std::fs::write(format!("{prefix}_{ext}.bmp"), f).unwrap();
             }
+        }
+    }
+
+    fn heads(e: &Editor) -> Vec<(usize, usize)> {
+        e.sels.iter().map(|s| (s.a, s.h)).collect()
+    }
+
+    #[test]
+    fn ctrl_d_selects_word_then_next_matches() {
+        unsafe {
+            let e = editor("foo bar foo baz foo");
+            carets(e, &[1]);
+            e.select_next();
+            assert_eq!(heads(e), [(0, 3)]);
+            e.select_next();
+            assert_eq!(heads(e), [(0, 3), (8, 11)]);
+            e.select_next();
+            e.select_next(); // all three selected: nothing more to add
+            assert_eq!(heads(e).len(), 3);
+            e.char('x' as u16);
+            assert_eq!(text(e), "x bar x baz x");
+        }
+    }
+
+    #[test]
+    fn duplicate_delete_and_move_lines() {
+        unsafe {
+            let e = editor("a\nb\nc");
+            carets(e, &[2]); // on "b"
+            e.duplicate_lines();
+            assert_eq!(text(e), "a\nb\nb\nc");
+            assert_eq!(e.line_of(e.sels[0].h), 2); // cursor on the copy
+            e.undo();
+            assert_eq!(text(e), "a\nb\nc");
+            e.move_lines(false);
+            assert_eq!(text(e), "b\na\nc");
+            assert_eq!(e.sels[0].h, 0);
+            e.move_lines(false); // already at the top
+            assert_eq!(text(e), "b\na\nc");
+            e.move_lines(true);
+            e.move_lines(true);
+            assert_eq!(text(e), "a\nc\nb");
+            assert_eq!(e.line_of(e.sels[0].h), 2);
+            e.undo();
+            assert_eq!(text(e), "a\nb\nc");
+            carets(e, &[4]); // last line
+            e.delete_lines();
+            assert_eq!(text(e), "a\nb");
+            carets(e, &[0]);
+            e.delete_lines();
+            assert_eq!(text(e), "b");
+        }
+    }
+
+    #[test]
+    fn auto_close_pairs() {
+        unsafe {
+            let e = editor("");
+            e.char('(' as u16);
+            assert_eq!((text(e), e.sels[0].h), ("()".into(), 1));
+            e.char('"' as u16);
+            assert_eq!(text(e), "(\"\")");
+            e.char('"' as u16); // types over the closing quote
+            assert_eq!((text(e), e.sels[0].h), ("(\"\")".into(), 3));
+            e.char(')' as u16);
+            assert_eq!((text(e), e.sels[0].h), ("(\"\")".into(), 4));
+            let e = editor("[]");
+            carets(e, &[1]);
+            e.delete(false, false); // Backspace in an empty pair removes both
+            assert_eq!(text(e), "");
+            let e = editor("word");
+            e.sels = vec![Sel { a: 0, h: 4, x: -1 }];
+            e.char('[' as u16); // wraps the selection
+            assert_eq!(text(e), "[word]");
+            assert_eq!(heads(e), [(1, 5)]);
+            let e = editor("it");
+            carets(e, &[2]);
+            e.char('\'' as u16); // apostrophe after a word: no pair
+            assert_eq!(text(e), "it'");
+        }
+    }
+
+    #[test]
+    fn matching_brackets() {
+        unsafe {
+            let e = editor("f(a[1], {b})");
+            carets(e, &[1]);
+            assert_eq!(e.bracket_match(), Some((1, 11)));
+            carets(e, &[12]); // after the last ')'
+            assert_eq!(e.bracket_match(), Some((11, 1)));
+            carets(e, &[8]);
+            assert_eq!(e.bracket_match(), Some((8, 10)));
+        }
+    }
+
+    #[test]
+    fn column_selection_and_go_to() {
+        unsafe {
+            let e = editor("abcdef\nab\nabcdef");
+            MoveWindow(e.h, 0, 0, 400, 300, 0);
+            let x = |p: usize| e.x_of(p);
+            let (x1, x4) = (x(1), x(4));
+            e.column_select((0, 0), x1, (2, 0), x4);
+            assert_eq!(heads(e), [(1, 4), (8, 9), (11, 14)]); // the short line is selected to its end
+            e.go_to(3, 3);
+            assert_eq!(heads(e), [(12, 12)]);
+            e.go_to(99, 99);
+            assert_eq!(heads(e), [(16, 16)]);
+        }
+    }
+
+    #[test]
+    fn add_cursor_above_and_below() {
+        unsafe {
+            let e = editor("abcd\nab\nabcd\nabcd");
+            MoveWindow(e.h, 0, 0, 400, 300, 0);
+            carets(e, &[11]); // line 3, column 3
+            e.add_cursor(false);
+            e.add_cursor(false); // line 1: the short line 2 keeps the remembered column
+            assert_eq!(heads(e), [(3, 3), (7, 7), (11, 11)]);
+            e.add_cursor(true); // below the bottommost cursor (line 3), not the newest one
+            assert_eq!(heads(e), [(3, 3), (7, 7), (11, 11), (16, 16)]);
+            e.add_cursor(false); // above the topmost: already line 1, nothing to add
+            assert_eq!(heads(e).len(), 4);
+            e.char('x' as u16);
+            assert_eq!(text(e), "abcxd\nabx\nabcxd\nabcxd");
+        }
+    }
+
+    #[test]
+    fn incremental_line_index_matches_full_rescan() {
+        unsafe {
+            let e = editor("ab\ncd\n\nef");
+            let mut seed = 7u32;
+            let mut rnd = |n: usize| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                (seed >> 8) as usize % n.max(1)
+            };
+            let pieces = ["x", "\n", "y\nz", "\n\n", ""];
+            for _ in 0..300 {
+                let at = rnd(e.text.len() + 1);
+                let del = rnd(4).min(e.text.len() - at);
+                let ins: Vec<u16> = pieces[rnd(pieces.len())].encode_utf16().collect();
+                e.replace(at..at + del, ins);
+                let incremental = e.lines.clone();
+                e.reindex();
+                assert_eq!(incremental, e.lines);
+            }
+            while !e.undo.is_empty() {
+                e.undo();
+                let incremental = e.lines.clone();
+                e.reindex();
+                assert_eq!(incremental, e.lines);
+            }
+            assert_eq!(text(e), "ab\ncd\n\nef");
+        }
+    }
+
+    #[test]
+    fn syntax_checkpoints_match_full_scan() {
+        unsafe {
+            // Markdown code fences every 300 lines: the context depends on everything above.
+            let doc: String = (0..2000).map(|i| if i % 300 == 0 { "```\n".to_string() } else { format!("line {i}\n") }).collect();
+            let e = editor(&doc);
+            e.set_lang(Lang::Markdown);
+            let full = |e: &Editor, line: usize| {
+                let mut ctx = syntax::context(Lang::Markdown, (0..e.lines.len()).map(|l| &e.text[e.line(l)]), line);
+                syntax::line_spans(Lang::Markdown, &e.text[e.line(line)], &mut ctx)
+            };
+            let cached = |e: &mut Editor, line: usize| {
+                let mut ctx = e.ctx_at(line);
+                syntax::line_spans(Lang::Markdown, &e.text[e.line(line)], &mut ctx)
+            };
+            for line in [1990, 5, 1500, 700, 1999] {
+                assert_eq!(cached(e, line), full(e, line));
+            }
+            // An edit near the top (adding a fence) must invalidate the later checkpoints.
+            e.replace(e.lines[10]..e.lines[10], "```\n".encode_utf16().collect());
+            for line in [1990, 600, 11, 1200] {
+                assert_eq!(cached(e, line), full(e, line));
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_letter_control_characters_are_ignored() {
+        unsafe {
+            let e = editor("make this italic");
+            e.set_lang(Lang::Markdown);
+            e.sels = vec![Sel { a: 5, h: 9, x: -1 }];
+            // Ctrl+I: the key press wraps the selection, then Windows sends a Tab character.
+            e.toggle_marker("*");
+            e.typed(TAB, true);
+            assert_eq!(text(e), "make *this* italic");
+            assert_eq!(heads(e), [(6, 10)]);
+            e.typed(CR, true); // Ctrl+M
+            assert_eq!(text(e), "make *this* italic");
+            e.typed(TAB, false); // a real Tab still works
+            assert_eq!(text(e), "make *\t* italic");
+        }
+    }
+
+    #[test]
+    fn markdown_bold_and_italic_toggle() {
+        unsafe {
+            let e = editor("make this bold");
+            e.set_lang(Lang::Markdown);
+            e.sels = vec![Sel { a: 5, h: 9, x: -1 }]; // "this"
+            e.toggle_marker("**");
+            assert_eq!(text(e), "make **this** bold");
+            assert_eq!(heads(e), [(7, 11)]); // still "this"
+            e.toggle_marker("*");
+            assert_eq!(text(e), "make ***this*** bold");
+            e.toggle_marker("**"); // remove bold, keep italic
+            assert_eq!(text(e), "make *this* bold");
+            e.toggle_marker("*");
+            assert_eq!(text(e), "make this bold");
+            carets(e, &[1, 13]); // inside "make" and "bold": whole words
+            e.toggle_marker("*");
+            assert_eq!(text(e), "*make* this *bold*");
+            carets(e, &[6]); // after "*make*": no word, empty pair with the caret inside
+            e.toggle_marker("**");
+            assert_eq!(text(e), "*make***** this *bold*");
+            assert_eq!(heads(e), [(8, 8)]);
         }
     }
 
