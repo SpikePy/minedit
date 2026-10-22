@@ -6,6 +6,7 @@ use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*};
 const GLYPH_CLOSE: &str = "\u{E8BB}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_MENU: &str = "\u{E700}";
+const GLYPH_TREE: &str = "\u{E90C}"; // DockLeft: the sidebar
 const GLYPH_MIN: &str = "\u{E921}";
 const GLYPH_MAX: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
@@ -16,6 +17,7 @@ pub enum Hit {
     Tab(usize),
     TabClose(usize),
     NewTab,
+    Tree,
     Menu,
     Min,
     Max,
@@ -30,6 +32,7 @@ pub struct Rects {
     pub tabs: Vec<RECT>,
     pub closes: Vec<RECT>,
     pub new_tab: RECT,
+    pub tree: RECT,
     pub menu: RECT,
     pub min: RECT,
     pub max: RECT,
@@ -45,6 +48,7 @@ pub struct Look {
     pub active: bool,
     pub maximized: bool,
     pub hover: Hit,
+    pub tree_open: bool,
 }
 
 fn px(v: i32, dpi: u32) -> i32 {
@@ -68,7 +72,10 @@ pub fn layout(width: i32, dpi: u32, n: usize, scroll: i32) -> Rects {
     let max = rect(close.left - bw, 0, close.left, h);
     let min = rect(max.left - bw, 0, max.left, h);
     let menu = rect(min.left - bw, 0, min.left, h);
-    let (x0, top, plus) = (p(8), p(4), p(32));
+    let (top, plus) = (p(4), p(32));
+    // The file tree button comes first, then the tabs.
+    let tree = rect(p(6), top + p(2), p(6) + plus, h - p(2));
+    let x0 = tree.right + p(4);
     // Tabs share the space, leaving some empty title bar to drag the window by.
     let avail = (menu.left - x0 - plus - p(40)).max(p(60));
     let tw = (avail / n.max(1) as i32).clamp(p(60), p(200));
@@ -82,7 +89,7 @@ pub fn layout(width: i32, dpi: u32, n: usize, scroll: i32) -> Rects {
     }).collect();
     let nx = (x0 + n as i32 * tw - sx).min(x0 + avail) + p(4);
     let clip = rect(x0, 0, x0 + avail.min(n as i32 * tw), h);
-    Rects { height: h, clip, max_scroll, tabs, closes, new_tab: rect(nx, top + p(2), nx + plus, h - p(2)), menu, min, max, close }
+    Rects { height: h, clip, max_scroll, tabs, closes, new_tab: rect(nx, top + p(2), nx + plus, h - p(2)), tree, menu, min, max, close }
 }
 
 pub fn hit(r: &Rects, x: i32, y: i32) -> Hit {
@@ -104,6 +111,9 @@ pub fn hit(r: &Rects, x: i32, y: i32) -> Hit {
     }
     if inside(&r.new_tab, x, y) {
         return Hit::NewTab;
+    }
+    if inside(&r.tree, x, y) {
+        return Hit::Tree;
     }
     Hit::Caption
 }
@@ -168,6 +178,14 @@ pub unsafe fn paint(dc: HDC, width: i32, r: &Rects, tabs: &[(String, bool)], cur
         tab_shape(dc, &rect(r.new_tab.left, r.new_tab.top, r.new_tab.right, r.new_tab.bottom - p(4)), c.hover, p(4));
     }
     text(dc, l.icons, GLYPH_ADD, &r.new_tab, fg, DT_CENTER);
+    // The file tree button stays highlighted while the tree is shown.
+    let tr = rect(r.tree.left, r.tree.top, r.tree.right, r.tree.bottom - p(4));
+    if l.hover == Hit::Tree {
+        tab_shape(dc, &tr, c.hover, p(4));
+    } else if l.tree_open {
+        tab_shape(dc, &tr, c.tab_hover, p(4));
+    }
+    text(dc, l.icons, GLYPH_TREE, &tr, fg, DT_CENTER);
     let max_glyph = if l.maximized { GLYPH_RESTORE } else { GLYPH_MAX };
     for (rc, h, glyph) in [(&r.menu, Hit::Menu, GLYPH_MENU), (&r.min, Hit::Min, GLYPH_MIN), (&r.max, Hit::Max, max_glyph), (&r.close, Hit::Close, GLYPH_CLOSE)] {
         let hot = l.hover == h;
@@ -229,6 +247,8 @@ mod tests {
         assert_eq!(at(&r.closes[1]), Hit::TabClose(1));
         assert_eq!(hit(&r, r.tabs[0].left + 5, 20), Hit::Tab(0));
         assert_eq!(at(&r.new_tab), Hit::NewTab);
+        assert_eq!(at(&r.tree), Hit::Tree);
+        assert!(r.tree.right < r.tabs[0].left);
         assert_eq!(hit(&r, r.menu.left - 5, 10), Hit::Caption);
         assert_eq!(hit(&r, 100, 1), Hit::Caption); // above the tabs: drag area
         assert_eq!(hit(&r, 100, 40), Hit::None);
@@ -270,7 +290,7 @@ mod tests {
                 let r = layout(w, dpi, n, 0);
                 let look = Look {
                     font: font("Segoe UI", 15), icons: font("Segoe Fluent Icons", 12), small_icons: font("Segoe Fluent Icons", 10),
-                    dpi, active, maximized, hover,
+                    dpi, active, maximized, hover, tree_open: k % 2 == 0,
                 };
                 SetViewportOrgEx(dc, 0, k as i32 * (bh + 8), null_mut());
                 paint(dc, w, &r, &tabs[..n], cur, &look);

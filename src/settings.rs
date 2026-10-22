@@ -127,7 +127,7 @@ fn rows(v: &Values, fonts: Vec<String>) -> Vec<Row> {
         row("Highlight the current line", "highlight_line", Kind::Toggle, on(v.highlight_line)),
         row("Auto-close brackets and quotes", "auto_close", Kind::Toggle, on(v.auto_close)),
         row("Margin around the text", "margin", choices(margins), v.margin.to_string()),
-        row("Recent files in Ctrl+P", "recent_files", choices(recents), v.recent.to_string()),
+        row("Number of recent files", "recent_files", choices(recents), v.recent.to_string()),
     ]
 }
 
@@ -231,7 +231,7 @@ pub unsafe fn recolor() {
 }
 
 /// Draws a toggle row: label left, a Windows 11 style switch right.
-unsafe fn draw_toggle(d: &DRAWITEMSTRUCT, label: &str, on: bool) {
+pub unsafe fn draw_toggle(d: &DRAWITEMSTRUCT, label: &str, on: bool) {
     let dc = d.hDC;
     let c = theme::palette();
     let rc = d.rcItem;

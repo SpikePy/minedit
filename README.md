@@ -3,7 +3,7 @@
 [![build](https://github.com/SpikePy/minedit/actions/workflows/build.yml/badge.svg)](https://github.com/SpikePy/minedit/actions/workflows/build.yml)
 
 A minimal text editor for Windows 11 that starts instantly. Written in Rust on
-the plain Win32 API: one ~400 KB `.exe`, no runtime, no DLLs to install.
+the plain Win32 API: one ~750 KB `.exe`, no runtime, no DLLs to install.
 
 **Download** `minedit.exe` from the
 [latest release](https://github.com/SpikePy/minedit/releases/latest) and run it.
@@ -27,12 +27,22 @@ the plain Win32 API: one ~400 KB `.exe`, no runtime, no DLLs to install.
   schemes from the most popular families (One Dark, Dracula, GitHub, Monokai,
   Solarized, Material, Catppuccin, Tokyo Night, Gruvbox, Nord, Ayu, Darcula,
   Rosé Pine, Kanagawa, …) — pick with live preview via Ctrl+K Ctrl+T
-- **Find and replace** with a match counter
+- **Find and replace** bar over the editor: match case, regex, up/down,
+  match counter
 - **Detects files changed by other programs** and reloads them
 - Keeps each file's encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI)
   and line endings (CRLF/LF)
 - Status bar with line/column, word wrap, encoding, line endings and
   language — click any of them to change it
+- **Sidebar** (button at the left of the title bar) with two views:
+  - **Files**: "Select Folder" in the Open dialog (or Ctrl+K Ctrl+O) shows a
+    folder without opening its files; rename (F2), move (drag) and delete
+    (Del) files; the active tab's file is highlighted, and Ctrl+P also finds
+    the folder's files
+  - **Search** (Ctrl+Shift+F / Ctrl+Shift+H): find and replace in open tabs
+    and the folder, with match case, whole word, regular expressions and
+    file filters like `*.rs, !target`; matches listed by file and line
+- **Recently Opened** in the File menu: recent files and folders
 - **Multiple windows**: Ctrl+Shift+N or middle-click on the taskbar button
   opens a new window on the current virtual desktop; files opened from
   Explorer become tabs in the frontmost window on that desktop. "Open with"
@@ -46,8 +56,10 @@ Press **Ctrl+/** in minedit for an overview of all shortcuts.
 | Keys | Action |
 |---|---|
 | Ctrl+T / Ctrl+N | New tab |
-| Ctrl+O | Open |
-| Ctrl+P | Quick open: fuzzy search open and recent files |
+| Ctrl+O | Open files, or a folder with "Select Folder" |
+| Ctrl+P | Quick open: fuzzy search open, recent and folder files |
+| Ctrl+K Ctrl+O | Open folder in the file tree |
+| Ctrl+Shift+E | Sidebar: files (again: hide) |
 | Ctrl+S / Ctrl+Shift+S | Save / Save As |
 | Ctrl+W, middle-click a tab | Close tab |
 | Ctrl+Shift+T | Reopen closed tab |
@@ -65,7 +77,9 @@ Press **Ctrl+/** in minedit for an overview of all shortcuts.
 | Esc | Back to a single cursor |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Tab / Shift+Tab | Indent / unindent selected lines |
-| Ctrl+F / F3 / Ctrl+H | Find / find next / replace |
+| Ctrl+F / Ctrl+H | Find / replace bar |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+Shift+F / Ctrl+Shift+H | Sidebar: search / replace in tabs and folder |
 | Alt+Z | Toggle word wrap |
 | Ctrl+K Ctrl+T | Color scheme (live preview) |
 | Ctrl+, | Settings |
@@ -116,6 +130,9 @@ GitHub Actions tests and builds every push on Windows. Pushing a tag like
 
 | File | Purpose |
 |---|---|
+| `src/tree.rs` | File tree |
+| `src/dialog.rs` | Open and folder dialogs |
+| `src/search.rs` | Sidebar search: regex, file filter, results |
 | `src/main.rs` | Window, tabs, files, session, settings, find/replace |
 | `src/edit.rs` | The text control: multi-cursor editing, undo, drawing |
 | `src/syntax.rs` | Line-by-line syntax highlighting |

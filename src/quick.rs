@@ -1,5 +1,5 @@
 //! Ctrl+P: quick open. A popup with a search box and a fuzzy-filtered list of open files,
-//! then (below a line) recently opened files.
+//! then (each below a line) recently opened files and matching files of the open folder.
 
 use crate::theme;
 use std::{cell::RefCell, mem::zeroed, ptr::{null, null_mut}};
@@ -16,7 +16,15 @@ use windows_sys::{
 pub struct Item {
     pub name: String,
     pub dir: String,
-    pub open: bool, // an open tab (listed first) rather than a recent file
+    pub group: Group,
+}
+
+/// The sections of the list, in this order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Group {
+    Open,
+    Recent,
+    Folder, // files of the open folder: only shown for a search
 }
 
 /// How the list behaves.
@@ -58,8 +66,14 @@ fn px(v: i32, dpi: u32) -> i32 {
 
 /// Score of `q` matching `t` as a subsequence (both lowercase), or None. Higher is better:
 /// consecutive letters and word starts count extra, gaps and long texts cost a little.
+/// Every place the first letter occurs is tried ("md" scores best at the end of "readme.md").
 pub fn fuzzy(q: &[char], t: &[char]) -> Option<i32> {
-    let (mut score, mut from, mut prev) = (0, 0, usize::MAX);
+    let first = *q.first()?;
+    (0..t.len()).filter(|&i| t[i] == first).filter_map(|i| fuzzy_from(q, t, i)).max()
+}
+
+fn fuzzy_from(q: &[char], t: &[char], start: usize) -> Option<i32> {
+    let (mut score, mut from, mut prev) = (0, start, usize::MAX);
     for &c in q {
         let i = (from..t.len()).find(|&i| t[i] == c)?;
         score += 10;
@@ -83,12 +97,17 @@ pub fn rank(query: &str, item: &Item) -> Option<i32> {
     fuzzy(&q, &name).map(|s| s + 1000).or_else(|| fuzzy(&q, &full))
 }
 
-/// Indices of the items matching `query`: open files first, then best match first.
+/// Indices of the items matching `query`: by group, then best match first.
 pub fn filter(items: &[Item], query: &str) -> Vec<usize> {
-    let mut hits: Vec<(bool, i32, usize)> = items.iter().enumerate()
-        .filter_map(|(i, it)| if query.trim().is_empty() { Some((it.open, 0, i)) } else { rank(query, it).map(|s| (it.open, s, i)) })
+    let empty = query.trim().is_empty();
+    let mut hits: Vec<(Group, i32, usize)> = items.iter().enumerate()
+        .filter_map(|(i, it)| match (empty, it.group) {
+            (true, Group::Folder) => None,
+            (true, _) => Some((it.group, 0, i)),
+            _ => rank(query, it).map(|s| (it.group, s, i)),
+        })
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     hits.into_iter().map(|h| h.2).collect()
 }
 
@@ -161,17 +180,41 @@ unsafe fn resize() {
 }
 
 unsafe fn refilter() {
+    update(Vec::new(), false);
+}
+
+/// Whether the popup is open.
+pub fn is_open() -> bool {
+    QUICK.with(|q| q.borrow().is_some())
+}
+
+/// Adds items found later (the open folder's files), keeping the highlighted item.
+pub unsafe fn add(items: Vec<Item>) {
+    update(items, true);
+}
+
+unsafe fn update(new: Vec<Item>, keep: bool) {
     let Some(input) = QUICK.with(|q| q.borrow().as_ref().map(|q| q.input)) else { return };
     let mut buf = [0u16; 512];
     let n = GetWindowTextW(input, buf.as_mut_ptr(), buf.len() as i32) as usize;
     let query = String::from_utf16_lossy(&buf[..n]);
-    QUICK.with(|q| {
-        if let Some(q) = q.borrow_mut().as_mut() {
-            (q.shown, q.sel, q.top) = (filter(&q.items, &query), 0, 0);
-        }
+    let moved = QUICK.with(|q| {
+        let mut q = q.borrow_mut();
+        let q = q.as_mut()?;
+        let old = q.shown.get(q.sel).copied();
+        q.items.extend(new);
+        q.shown = filter(&q.items, &query);
+        let sel = old.filter(|_| keep).and_then(|o| q.shown.iter().position(|&i| i == o)).unwrap_or(0);
+        q.top = if keep { q.top.min(sel) } else { 0 };
+        let moved = q.shown.get(sel).copied() != old;
+        q.sel = sel;
+        InvalidateRect(q.popup, null(), 0);
+        Some(moved)
     });
     resize();
-    previewed();
+    if moved == Some(true) || !keep {
+        previewed();
+    }
 }
 
 /// Moves the selection by `d` rows, keeping it visible.
@@ -232,8 +275,8 @@ unsafe fn paint(h: HWND) {
             if row == q.sel {
                 fill(RECT { left: p(4), top: y - p(2), right: rc.right - p(4), bottom: y + p(24) }, c.sel);
             }
-            // A line between the open files and the recent ones.
-            if !it.open && row > 0 && q.items[q.shown[row - 1]].open {
+            // A line between the sections.
+            if row > 0 && it.group != q.items[q.shown[row - 1]].group {
                 fill(RECT { left: p(8), top: y - p(3), right: rc.right - p(8), bottom: y - p(2) }, c.separator);
             }
             let w = text(&it.name, p(14), y + p(2), c.fg);
@@ -318,7 +361,7 @@ mod tests {
 
     fn item(path: &str, open: bool) -> Item {
         let (dir, name) = path.rsplit_once('\\').unwrap();
-        Item { name: name.into(), dir: dir.into(), open }
+        Item { name: name.into(), dir: dir.into(), group: if open { Group::Open } else { Group::Recent } }
     }
 
     #[test]
@@ -328,6 +371,8 @@ mod tests {
         assert!(s("rsm", "main.rs").is_none()); // order matters
         assert!(s("main", "main.rs") > s("main", "my_awesome_main.rs")); // prefix and shorter win
         assert!(s("er", "edit.rs") < s("ed", "edit.rs"));
+        assert!(s("md", "readme.md") > s("md", "minedit.ico")); // the best place, not the first one
+        assert!(s("", "x").is_none());
     }
 
     #[test]
@@ -344,5 +389,16 @@ mod tests {
         // Empty query: open files, then the rest in their order.
         assert_eq!(filter(&items, ""), [2, 0, 1]);
         assert_eq!(filter(&items, "xyz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn folder_files_only_for_a_search_and_last() {
+        let mut items = vec![item(r"C:\a\recent.md", false), item(r"C:\a\open.rs", true)];
+        items.push(Item { name: "readme.md".into(), dir: r"proj\docs".into(), group: Group::Folder });
+        items.push(Item { name: "lib.rs".into(), dir: r"proj\src".into(), group: Group::Folder });
+        assert_eq!(filter(&items, ""), [1, 0]);
+        assert_eq!(filter(&items, "md"), [0, 2]); // recent before the folder's files
+        assert_eq!(filter(&items, "srclib"), [3]); // matched with its path
+        assert_eq!(filter(&items, "lib"), [3]);
     }
 }

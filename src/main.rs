@@ -1,16 +1,20 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod dialog;
 mod edit;
+mod findbar;
 mod help;
 mod quick;
+mod search;
 mod settings;
 mod syntax;
 mod theme;
 mod titlebar;
+mod tree;
 
 use edit::ed;
 use titlebar::Hit;
-use std::{cell::RefCell, ffi::c_void, mem::zeroed, path::PathBuf, ptr::{null, null_mut}, sync::atomic::{AtomicU32, Ordering::Relaxed}, time::SystemTime};
+use std::{cell::RefCell, ffi::c_void, mem::zeroed, path::{Path, PathBuf}, ptr::{null, null_mut}, sync::atomic::{AtomicU32, Ordering::Relaxed}, time::SystemTime};
 use windows_sys::{
     core::{GUID, HRESULT},
     w,
@@ -64,6 +68,13 @@ const ID_QUICKOPEN: u16 = 24;
 const ID_SCHEME: u16 = 25;
 const ID_SETTINGS_UI: u16 = 26;
 const ID_NEWWINDOW: u16 = 27;
+const ID_OPENFOLDER: u16 = 28;
+const ID_TREE: u16 = 29;
+const ID_CLEAR_RECENT: u16 = 30;
+const ID_FINDFILES: u16 = 31;
+const ID_REPLACEFILES: u16 = 32;
+const ID_FINDPREV: u16 = 33;
+const ID_RECENT: u16 = 1000; // File > Recently Opened entries: ID_RECENT + index
 const MAX_CLOSED: usize = 50;
 const TIMER_FILES: usize = 1; // look for files changed by other programs
 const TIMER_SESSION: usize = 2; // save the session shortly after a change
@@ -73,6 +84,12 @@ const COPYDATA_OPEN: usize = 0x6F70656E;
 const WM_OPEN_INCOMING: u32 = WM_APP + 2;
 /// Posted to a window whose last tab was dragged away: it closes.
 const WM_CLOSE_EMPTY: u32 = WM_APP + 3;
+/// Lists the file tree's folder again (posted when a window is activated).
+const WM_TREE_REFRESH: u32 = WM_APP + 4;
+/// Files of the open folder found for Ctrl+P: wParam = search number, lParam = Box<Vec<PathBuf>>.
+const WM_QUICK_FILES: u32 = WM_APP + 5;
+/// Counts Ctrl+P searches, so a folder walk for an earlier one stops.
+static QUICK_SEARCH: AtomicU32 = AtomicU32::new(0);
 const ID_TAB1: u16 = 100; // Alt+1..9 map to ID_TAB1..ID_TAB1+8
 
 const DEFAULT_SETTINGS: &str = "\
@@ -90,7 +107,7 @@ auto_close = true
 theme = system
 # one of the schemes in Settings > Color Scheme (Ctrl+K Ctrl+T)
 color_scheme = Visual Studio
-# number of recently opened files offered by Ctrl+P
+# number of recently opened files (Ctrl+P, File menu) and folders (File menu)
 recent_files = 20
 ";
 
@@ -137,12 +154,30 @@ struct Win {
     place: Option<(RECT, bool)>, // restored window rect and maximized state
     drag: Option<Drag>, // a tab being dragged
     scroll: i32,        // tab bar scroll position in pixels
+    tree: HWND,             // file tree, created when a folder is first opened
+    root: Option<PathBuf>,  // the file tree's folder
+    side_shown: bool,       // the sidebar on the left
+    view: View,             // what the sidebar shows
+    search: HWND,           // the sidebar's search view, created when first shown
+    open_btn: HWND,         // "Open Folder…" in the files view while no folder is open
+    tree_w: i32,            // file tree width at 96 DPI
+    split: Option<i32>,     // dragging the splitter: mouse offset from the tree's right edge
+    revealed: Option<Option<PathBuf>>, // the active tab's file last selected in the tree
+    tree_drag: Option<PathBuf>,        // a file or folder being dragged in the tree
 }
 
 impl Win {
     const fn new(main: HWND) -> Win {
-        Win { main, tabs: Vec::new(), cur: 0, hover: Hit::None, pressed: Hit::None, active: false, status_items: Vec::new(), place: None, drag: None, scroll: 0 }
+        Win { main, tabs: Vec::new(), cur: 0, hover: Hit::None, pressed: Hit::None, active: false, status_items: Vec::new(), place: None, drag: None, scroll: 0,
+            tree: null_mut(), root: None, side_shown: false, view: View::Files, search: null_mut(), open_btn: null_mut(), tree_w: 240, split: None, revealed: None, tree_drag: None }
     }
+}
+
+/// The sidebar's views, switched by the icons at its top.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum View {
+    Files,
+    Search,
 }
 
 #[derive(Clone, Copy)]
@@ -160,14 +195,18 @@ struct State {
     ufont: HFONT,
     ifont: HFONT,  // caption button glyphs
     ifont_small: HFONT,
+    ifont_big: HFONT, // the sidebar's view icons
     checking: bool, // a file-changed prompt is open
     goto: Option<(usize, usize)>, // line and column entered in the Go to Line dialog
     closed: Vec<Closed>, // most recently closed last
     incoming: Vec<PathBuf>, // files handed over by another launch, opened asynchronously
     later: Vec<(HWND, Option<(RECT, bool)>)>, // restored extra windows, shown after the main one
-    recent: Vec<PathBuf>, // recently opened files, newest first
+    recent: Vec<(PathBuf, bool)>, // recently opened files and folders (true), newest first
+    recent_menu: HMENU,   // File > Recently Opened, filled when the menu opens
+    recent_shown: Vec<(PathBuf, bool)>, // what its entries open
     max_recent: usize,
     quick: Vec<Pick>,     // what each Ctrl+P list entry opens
+    findbar_used: bool,   // F3 searches again once the find bar was used
     dpi: u32,
     face: String,
     theme: String, // "system", "light" or "dark"
@@ -177,22 +216,16 @@ struct State {
     pt: i32,    // current font size, changed by Ctrl+wheel
     wheel: i32, // accumulated Ctrl+wheel delta, for high-resolution wheels and touchpads
     opts: edit::Options,
-    fdlg: HWND,                  // open Find/Replace dialog
-    fdlg_title: String,          // its original (localized) title, before the match count
-    fr: *mut FINDREPLACEW,       // lives for the whole process, as the modeless dialog requires
 }
 
 thread_local! {
     static S: RefCell<State> = const { RefCell::new(State {
-        win: Win::new(null_mut()), parked: Vec::new(), menu: null_mut(), efont: null_mut(), ufont: null_mut(), ifont: null_mut(), ifont_small: null_mut(),
-        checking: false, goto: None, closed: Vec::new(), incoming: Vec::new(), later: Vec::new(), recent: Vec::new(), max_recent: 20, quick: Vec::new(),
+        win: Win::new(null_mut()), parked: Vec::new(), menu: null_mut(), efont: null_mut(), ufont: null_mut(), ifont: null_mut(), ifont_small: null_mut(), ifont_big: null_mut(),
+        checking: false, goto: None, closed: Vec::new(), incoming: Vec::new(), later: Vec::new(), recent: Vec::new(), recent_menu: null_mut(), recent_shown: Vec::new(), max_recent: 20, quick: Vec::new(), findbar_used: false,
         dpi: 96, face: String::new(), theme: String::new(), scheme: String::new(), preview: None, size: 11, pt: 11, wheel: 0, opts: edit::Options { tab_width: 4, use_spaces: false, line_numbers: true, highlight_line: true, margin: 8, word_wrap: false, auto_close: true },
-        fdlg: null_mut(), fdlg_title: String::new(), fr: null_mut(),
+
     }) };
 }
-
-/// Registered message the Find/Replace dialog sends to the main window.
-static FINDMSG: AtomicU32 = AtomicU32::new(0);
 
 // Never call anything that can re-enter the window procedure inside `with`.
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -311,7 +344,7 @@ unsafe fn setting_changed(key: &str, value: &str) {
     if key != "size" {
         with(|s| s.pt = pt); // keep the Ctrl+wheel zoom unless the size itself changed
     }
-    with(|s| s.recent.truncate(s.max_recent));
+    with(|s| trim_recent(&mut s.recent, s.max_recent));
     set_fonts();
     schedule_save();
 }
@@ -364,15 +397,25 @@ unsafe fn icon_font(px: i32, dpi: u32) -> HFONT {
 
 unsafe fn set_fonts() {
     let (old, edits) = with(|s| {
-        let old = [s.efont, s.ufont, s.ifont, s.ifont_small];
+        let old = [s.efont, s.ufont, s.ifont, s.ifont_small, s.ifont_big];
         s.efont = font(&s.face, s.pt, s.dpi);
         s.ufont = font("Segoe UI", 9, s.dpi);
-        (s.ifont, s.ifont_small) = (icon_font(10, s.dpi), icon_font(8, s.dpi));
+        (s.ifont, s.ifont_small, s.ifont_big) = (icon_font(10, s.dpi), icon_font(8, s.dpi), icon_font(14, s.dpi));
         edit::set_view(s.efont, &edit::Options { margin: s.opts.margin * s.dpi as i32 / 96, ..s.opts });
         (old, all_edits(s))
     });
     for e in edits {
         PostMessageW(e, edit::UPDATE, 0, 0);
+    }
+    // Before the old font is deleted.
+    let (font, dpi) = with(|s| (s.ufont, s.dpi));
+    for t in with(|s| all_trees(s)) {
+        tree::set_font(t, font, dpi);
+    }
+    findbar::set_all_fonts(font, with(|s| s.ifont));
+    for (panel, button) in with(|s| std::iter::once(&s.win).chain(&s.parked).map(|w| (w.search, w.open_btn)).collect::<Vec<_>>()) {
+        search::set_font(panel, font, dpi);
+        SendMessageW(button, WM_SETFONT, font as WPARAM, 1);
     }
     for f in old.into_iter().filter(|f| !f.is_null()) {
         DeleteObject(f);
@@ -415,15 +458,31 @@ unsafe fn apply_theme() {
         InvalidateRect(w, null(), 0);
     }
     dark_menus(dark);
+    for t in with(|s| all_trees(s)) {
+        tree::recolor(t);
+    }
     for e in edits {
         theme_editor(e);
         InvalidateRect(e, null(), 0);
     }
     settings::recolor();
+    findbar::recolor_all();
+    for (panel, button) in with(|s| std::iter::once(&s.win).chain(&s.parked).map(|w| (w.search, w.open_btn)).collect::<Vec<_>>()) {
+        search::recolor(panel);
+        SetWindowTheme(button, if dark { w!("DarkMode_Explorer") } else { w!("Explorer") }, null());
+    }
 }
 
 fn all_windows(s: &State) -> Vec<HWND> {
     std::iter::once(&s.win).chain(&s.parked).map(|w| w.main).filter(|m| !m.is_null()).collect()
+}
+
+fn all_tabs(s: &State) -> impl Iterator<Item = &Tab> {
+    std::iter::once(&s.win).chain(&s.parked).flat_map(|w| &w.tabs)
+}
+
+fn all_trees(s: &State) -> Vec<HWND> {
+    std::iter::once(&s.win).chain(&s.parked).map(|w| w.tree).filter(|t| !t.is_null()).collect()
 }
 
 fn all_edits(s: &State) -> Vec<HWND> {
@@ -711,165 +770,6 @@ fn cur_edit() -> HWND {
 }
 
 /// Start positions of all matches of `what` in `text`, honoring match-case and whole-word flags.
-unsafe fn hits(text: &[u16], what: &[u16], flags: u32) -> Vec<usize> {
-    let fold = |v: &[u16]| {
-        let mut v = v.to_vec();
-        if flags & FR_MATCHCASE == 0 && !v.is_empty() {
-            CharLowerBuffW(v.as_mut_ptr(), v.len() as u32);
-        }
-        v
-    };
-    let (t, w) = (fold(text), fold(what));
-    let word = |c: Option<&u16>| c.is_some_and(|&c| IsCharAlphaNumericW(c) != 0 || c == b'_' as u16);
-    (0..t.len())
-        .filter(|&i| t[i..].starts_with(&w))
-        .filter(|&i| flags & FR_WHOLEWORD == 0 || !(word(i.checked_sub(1).and_then(|j| t.get(j))) || word(t.get(i + w.len()))))
-        .collect()
-}
-
-unsafe fn not_found(what: &[u16]) {
-    let owner = with(|s| if s.fdlg.is_null() { s.win.main } else { s.fdlg });
-    let msg = wide(&format!("Cannot find \"{}\"", String::from_utf16_lossy(what)));
-    MessageBoxW(owner, msg.as_ptr(), wide(APP).as_ptr(), MB_ICONINFORMATION);
-}
-
-/// Selects the next match after the selection (or before it, searching up), wrapping around.
-unsafe fn find_next(edit: HWND, what: &[u16], flags: u32) {
-    let e = ed(edit);
-    let hits = hits(&e.text, what, flags);
-    let sel = e.sel();
-    let found = if flags & FR_DOWN != 0 {
-        hits.iter().find(|&&i| i >= sel.end).or(hits.first())
-    } else {
-        hits.iter().rev().find(|&&i| i < sel.start).or(hits.last())
-    };
-    match found {
-        Some(&i) => e.select(i, i + what.len()),
-        None => not_found(what),
-    }
-}
-
-unsafe fn find_dialog(replace: bool) {
-    let (old, fr, edit) = with(|s| (std::mem::replace(&mut s.fdlg, null_mut()), s.fr, s.win.tabs[s.win.cur].edit));
-    if !old.is_null() {
-        DestroyWindow(old);
-    }
-    // Prefill with the selection when it is a single line.
-    let e = ed(edit);
-    let selected = &e.text[e.sel()];
-    if !selected.is_empty() && selected.len() < 255 && !selected.contains(&(b'\n' as u16)) {
-        let buf = std::slice::from_raw_parts_mut((*fr).lpstrFindWhat, 256);
-        buf[..selected.len()].copy_from_slice(selected);
-        buf[selected.len()] = 0;
-    }
-    (*fr).Flags &= !(FR_DIALOGTERM | FR_FINDNEXT | FR_REPLACE | FR_REPLACEALL);
-    (*fr).hwndOwner = with(|s| s.win.main);
-    let dlg = if replace { ReplaceTextW(fr) } else { FindTextW(fr) };
-    with(|s| s.fdlg = dlg);
-}
-
-unsafe fn on_find(fr: *const FINDREPLACEW) {
-    let f = (*fr).Flags;
-    if f & FR_DIALOGTERM != 0 {
-        return with(|s| s.fdlg = null_mut());
-    }
-    let cstr = |p: *const u16| (0..).take_while(|&i| *p.add(i) != 0).map(|i| *p.add(i)).collect::<Vec<u16>>();
-    let (what, repl) = (cstr((*fr).lpstrFindWhat), cstr((*fr).lpstrReplaceWith));
-    let edit = cur_edit();
-    if what.is_empty() {
-        return;
-    }
-    let e = ed(edit);
-    if f & FR_REPLACEALL != 0 {
-        let mut out = Vec::with_capacity(e.text.len());
-        let mut pos = 0;
-        for i in hits(&e.text, &what, f) {
-            if i >= pos {
-                out.extend_from_slice(&e.text[pos..i]);
-                out.extend_from_slice(&repl);
-                pos = i + what.len();
-            }
-        }
-        if pos == 0 {
-            return not_found(&what);
-        }
-        out.extend_from_slice(&e.text[pos..]);
-        e.replace(0..e.text.len(), out);
-        return e.select(0, 0);
-    }
-    if f & FR_REPLACE != 0 {
-        let sel = e.sel();
-        if sel.len() == what.len() && hits(&e.text, &what, f).contains(&sel.start) {
-            e.replace(sel, repl);
-        }
-    }
-    // The Replace dialog has no direction buttons; it always searches down.
-    find_next(edit, &what, if f & FR_REPLACE != 0 { f | FR_DOWN } else { f });
-    update_count();
-}
-
-// Controls of the common Find/Replace dialog.
-const FIND_TEXT: i32 = 0x480;
-const WHOLE_WORD: i32 = 0x410;
-const MATCH_CASE: i32 = 0x411;
-
-/// Hook for the Find/Replace dialog: keeps the match count in its title up to date.
-unsafe extern "system" fn find_hook(dlg: HWND, m: u32, wp: WPARAM, _: LPARAM) -> usize {
-    match m {
-        WM_INITDIALOG => {
-            let mut buf = [0u16; 128];
-            let n = GetWindowTextW(dlg, buf.as_mut_ptr(), buf.len() as i32);
-            with(|s| (s.fdlg, s.fdlg_title) = (dlg, String::from_utf16_lossy(&buf[..n as usize])));
-            update_count();
-            1 // let the dialog set the default focus
-        }
-        WM_COMMAND => {
-            let (id, code) = ((wp & 0xFFFF) as i32, ((wp >> 16) & 0xFFFF) as u32);
-            if (id == FIND_TEXT && code == EN_CHANGE) || ((id == WHOLE_WORD || id == MATCH_CASE) && code == BN_CLICKED) {
-                update_count();
-            }
-            0
-        }
-        _ => 0,
-    }
-}
-
-/// Shows "k of n matches" (or "n matches" / "No matches") in the Find/Replace dialog's title.
-unsafe fn update_count() {
-    let (dlg, title, edit) = with(|s| (s.fdlg, s.fdlg_title.clone(), s.win.tabs.get(s.win.cur).map(|t| t.edit)));
-    let Some(edit) = edit.filter(|_| !dlg.is_null()) else { return };
-    let mut buf = [0u16; 256];
-    let n = GetDlgItemTextW(dlg, FIND_TEXT, buf.as_mut_ptr(), buf.len() as i32) as usize;
-    let what = &buf[..n];
-    let checked = |id| IsDlgButtonChecked(dlg, id) == BST_CHECKED;
-    let flags = if checked(WHOLE_WORD) { FR_WHOLEWORD } else { 0 } | if checked(MATCH_CASE) { FR_MATCHCASE } else { 0 };
-    let count = if what.is_empty() {
-        String::new()
-    } else {
-        let e = ed(edit);
-        let hits = hits(&e.text, what, flags);
-        let sel = e.sel();
-        match (hits.len(), hits.iter().position(|&i| i == sel.start && sel.len() == what.len())) {
-            (0, _) => " – No matches".into(),
-            (1, Some(_)) => " – 1 of 1 match".into(),
-            (n, Some(k)) => format!(" – {} of {n} matches", k + 1),
-            (1, None) => " – 1 match".into(),
-            (n, None) => format!(" – {n} matches"),
-        }
-    };
-    SetWindowTextW(dlg, wide(&format!("{title}{count}")).as_ptr());
-}
-
-/// F3: repeat the last search, or open the Find dialog if there is none yet.
-unsafe fn find_again() {
-    let fr = with(|s| s.fr);
-    if *(*fr).lpstrFindWhat == 0 {
-        return find_dialog(false);
-    }
-    let what: Vec<u16> = (0..).map(|i| *(*fr).lpstrFindWhat.add(i)).take_while(|&c| c != 0).collect();
-    find_next(cur_edit(), &what, (*fr).Flags);
-}
-
 /// Name shared by all launches using the same data folder (sandboxed test copies get their own).
 fn instance_name() -> String {
     use std::hash::{Hash, Hasher};
@@ -1148,16 +1048,315 @@ fn bar_rects() -> titlebar::Rects {
     titlebar::layout(rc.right, dpi, n, scroll)
 }
 
-/// Editors fill the window below the title bar.
+/// The splitter between sidebar and editor (empty while the sidebar is hidden).
+fn splitter() -> RECT {
+    let (main, dpi, shown, tree_w) = with(|s| (s.win.main, s.dpi, s.win.side_shown, s.win.tree_w));
+    let mut rc: RECT = unsafe { zeroed() };
+    unsafe { GetClientRect(main, &mut rc) };
+    if !shown {
+        return RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    }
+    let p = |v: i32| v * dpi as i32 / 96;
+    let x = p(tree_w).min(rc.right - p(200)).max(p(80));
+    RECT { left: x, top: bar_rects().height, right: x + p(4), bottom: rc.bottom - status_height() }
+}
+
+/// The strip with the view icons at the top of the sidebar, and the icons' rectangles.
+fn side_header() -> (RECT, [RECT; 2]) {
+    let split = splitter();
+    let dpi = with(|s| s.dpi) as i32;
+    let p = |v: i32| v * dpi / 96;
+    let top = split.top;
+    let r = RECT { left: 0, top, right: split.left, bottom: top + if split.right > 0 { p(34) } else { 0 } };
+    let icon = |i: i32| RECT { left: p(6) + i * p(36), top: top + p(2), right: p(6) + i * p(36) + p(32), bottom: r.bottom - p(2) };
+    (r, [icon(0), icon(1)])
+}
+
+/// The sidebar (if shown) on the left, editors filling the rest below the title bar.
 unsafe fn layout() {
-    let Some((main, edits)) = try_with(|s| Some((s.win.main, s.win.tabs.iter().map(|t| t.edit).collect::<Vec<_>>()))) else { return };
+    let Some((main, edits, tree, search, open_btn, view, root)) = try_with(|s| {
+        Some((s.win.main, s.win.tabs.iter().map(|t| t.edit).collect::<Vec<_>>(), s.win.tree, s.win.search, s.win.open_btn, s.win.view, s.win.root.is_some()))
+    }) else { return };
     let mut rc: RECT = zeroed();
     GetClientRect(main, &mut rc);
     let (h, sh) = (bar_rects().height, status_height());
+    let split = splitter();
+    let shown = split.right > 0;
+    // Created when first needed: the search view, the files view's "Open Folder…" button.
+    let search = if search.is_null() && shown && view == View::Search {
+        let (font, dpi) = with(|s| (s.ufont, s.dpi));
+        let p = search::create(main, font, dpi);
+        with(|s| s.win.search = p);
+        p
+    } else {
+        search
+    };
+    let open_btn = if open_btn.is_null() && shown && view == View::Files && !root {
+        let b = CreateWindowExW(0, w!("BUTTON"), w!("Open Folder…"), WS_CHILD | BS_PUSHBUTTON as u32, 0, 0, 0, 0, main, null_mut(), GetModuleHandleW(null()), null());
+        SendMessageW(b, WM_SETFONT, with(|s| s.ufont) as WPARAM, 0);
+        SetWindowTheme(b, if theme::is_dark() { w!("DarkMode_Explorer") } else { w!("Explorer") }, null());
+        with(|s| s.win.open_btn = b);
+        b
+    } else {
+        open_btn
+    };
+    let top = side_header().0.bottom;
+    let place = |w: HWND, visible: bool, r: RECT| {
+        if !w.is_null() {
+            MoveWindow(w, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
+            ShowWindow(w, if visible { SW_SHOW } else { SW_HIDE });
+        }
+    };
+    let content = RECT { left: 0, top, right: split.left, bottom: rc.bottom - sh };
+    place(tree, shown && view == View::Files && root, content);
+    place(search, shown && view == View::Search, content);
+    let p = |v: i32| v * with(|s| s.dpi) as i32 / 96;
+    let bw = (split.left - p(32)).max(p(40));
+    place(open_btn, shown && view == View::Files && !root, RECT { left: p(16), top: top + p(16), right: p(16) + bw, bottom: top + p(48) });
     for e in edits {
-        MoveWindow(e, 0, h, rc.right, rc.bottom - h - sh, 1);
+        MoveWindow(e, split.right, h, rc.right - split.right, rc.bottom - h - sh, 1);
     }
+    findbar::place(main, RECT { left: split.right, top: h, right: rc.right, bottom: rc.bottom - sh });
     repaint_bar();
+}
+
+/// Puts folder `dir` into the file tree of the current window.
+unsafe fn set_root(dir: PathBuf) {
+    let (main, tree, font, dpi) = with(|s| (s.win.main, s.win.tree, s.ufont, s.dpi));
+    let tree = if tree.is_null() {
+        let t = tree::create(main);
+        tree::set_font(t, font, dpi);
+        with(|s| s.win.tree = t);
+        t
+    } else {
+        tree
+    };
+    tree::fill(tree, &dir);
+    with(|s| (s.win.root, s.win.revealed) = (Some(dir), None));
+    reveal_active();
+    layout();
+    schedule_save();
+}
+
+/// Selects the active tab's file in the file tree when it changed (another tab, Save As, …).
+unsafe fn reveal_active() {
+    let Some((tree, root, path)) = with(|s| {
+        let path = s.win.tabs.get(s.win.cur).and_then(|t| t.path.clone());
+        if s.win.tree.is_null() || s.win.revealed.as_ref() == Some(&path) {
+            return None;
+        }
+        s.win.revealed = Some(path.clone());
+        Some((s.win.tree, s.win.root.clone()?, path))
+    }) else { return };
+    tree::reveal(tree, &root, path.as_deref());
+}
+
+/// File > Exit: closes all windows, keeping everything in the session (also used by the installer).
+unsafe fn exit_app() {
+    save_session();
+    for w in with(|s| all_windows(s)) {
+        // Later windows must not save a session with fewer windows: quitting happens before the timer.
+        DestroyWindow(w);
+    }
+}
+
+/// Right-click menu of a file tree item.
+unsafe fn tree_menu(path: PathBuf, top: bool, pt: POINT) {
+    let main = with(|s| s.win.main);
+    let menu = CreatePopupMenu();
+    let gray = |on: bool| if on { MF_ENABLED } else { MF_GRAYED };
+    let dir = path.is_dir();
+    if !dir {
+        AppendMenuW(menu, MF_STRING, 1, w!("&Open"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    }
+    AppendMenuW(menu, MF_STRING | gray(!top), 2, w!("&Rename\tF2"));
+    AppendMenuW(menu, MF_STRING | gray(!top), 3, w!("&Move To..."));
+    AppendMenuW(menu, MF_STRING | gray(!top), 4, w!("&Delete\tDel"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, 5, w!("Copy &Path"));
+    AppendMenuW(menu, MF_STRING, 6, w!("Show in &Explorer"));
+    let cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD, pt.x, pt.y, main, null());
+    DestroyMenu(menu);
+    match cmd {
+        1 => open_path(path),
+        2 => tree::edit_name(with(|s| s.win.tree)),
+        3 => {
+            if let Some(dir) = dialog::pick_folder(main, path.parent()) {
+                move_path(&path, &dir);
+            }
+        }
+        4 => delete_path(&path),
+        5 => _ = edit::set_clipboard(main, &path.to_string_lossy().encode_utf16().collect::<Vec<_>>()),
+        6 => {
+            let args = wide(&format!("/select,\"{}\"", path.display()));
+            ShellExecuteW(null_mut(), w!("open"), w!("explorer.exe"), args.as_ptr(), null(), SW_SHOWNORMAL);
+        }
+        _ => {}
+    }
+}
+
+/// Moves, renames or deletes through the Windows shell: its prompts (replace? delete for good?)
+/// and the Recycle Bin. True if it was done.
+unsafe fn shell_op(func: u32, from: &Path, to: Option<&Path>) -> bool {
+    let double_nul = |p: &Path| p.as_os_str().encode_wide().chain([0, 0]).collect::<Vec<u16>>();
+    use std::os::windows::ffi::OsStrExt;
+    let from = double_nul(from);
+    let to = to.map(double_nul);
+    let mut op: SHFILEOPSTRUCTW = zeroed();
+    op.hwnd = with(|s| s.win.main);
+    op.wFunc = func;
+    op.pFrom = from.as_ptr();
+    op.pTo = to.as_ref().map_or(null(), |t| t.as_ptr());
+    op.fFlags = FOF_ALLOWUNDO as u16;
+    SHFileOperationW(&mut op) == 0 && op.fAnyOperationsAborted == 0
+}
+
+unsafe fn rename_path(path: &Path, name: &str) {
+    let Some(new) = path.parent().map(|d| d.join(name)) else { return };
+    if new != path && shell_op(FO_RENAME, path, Some(&new)) {
+        path_moved(path, &new);
+    }
+    refresh_trees();
+}
+
+unsafe fn move_path(path: &Path, dir: &Path) {
+    let Some(new) = path.file_name().map(|n| dir.join(n)) else { return };
+    if path.parent() == Some(dir) || dir.starts_with(path) {
+        return; // already there, or into itself
+    }
+    if shell_op(FO_MOVE, path, Some(dir)) {
+        path_moved(path, &new);
+    }
+    refresh_trees();
+}
+
+unsafe fn delete_path(path: &Path) {
+    // Open tabs of deleted files stay, with their text, until they are closed.
+    shell_op(FO_DELETE, path, None);
+    refresh_trees();
+}
+
+/// After a rename or move: tabs of the file (or of files inside the folder) follow it.
+unsafe fn path_moved(old: &Path, new: &Path) {
+    let moved = |p: &Path| p.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) });
+    for w in with(|s| all_windows(s)) {
+        let prev = enter(w);
+        let tabs = with(|s| s.win.tabs.len());
+        for i in 0..tabs {
+            let Some(p) = with(|s| s.win.tabs[i].path.as_deref().and_then(moved)) else { continue };
+            let (edit, lang) = with(|s| {
+                let t = &mut s.win.tabs[i];
+                t.stamp = stamp(&p);
+                t.path = Some(p.clone());
+                (t.edit, t.lang)
+            });
+            ed(edit).set_lang(lang.unwrap_or(lang_of(Some(&p))));
+            refresh(i);
+        }
+        leave(prev);
+    }
+    with(|s| {
+        for r in &mut s.recent {
+            if let Some(p) = moved(&r.0) {
+                r.0 = p;
+            }
+        }
+    });
+    schedule_save();
+}
+
+/// Lists every window's file tree again (after files were renamed, moved or deleted).
+unsafe fn refresh_trees() {
+    for w in with(|s| all_windows(s)) {
+        PostMessageW(w, WM_TREE_REFRESH, 0, 0);
+    }
+}
+
+/// Ctrl+K Ctrl+O: picks a folder for the file tree.
+unsafe fn open_folder() {
+    let (main, initial) = with(|s| {
+        let file_dir = s.win.tabs.get(s.win.cur).and_then(|t| t.path.as_ref()?.parent().map(|d| d.to_path_buf()));
+        (s.win.main, s.win.root.clone().or(file_dir))
+    });
+    if let Some(dir) = dialog::pick_folder(main, initial.as_deref()) {
+        show_folder(dir);
+    }
+}
+
+/// Ctrl+O: files open as tabs; a folder goes into the file tree (further folders into new windows).
+unsafe fn open_dialog() {
+    let (main, initial) = with(|s| (s.win.main, s.win.tabs.get(s.win.cur).and_then(|t| t.path.as_ref()?.parent().map(|d| d.to_path_buf()))));
+    let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = dialog::open(main, initial.as_deref()).into_iter().partition(|p| p.is_dir());
+    files.into_iter().for_each(|p| open_path(p));
+    for (k, dir) in dirs.into_iter().enumerate() {
+        if k == 0 {
+            show_folder(dir);
+        } else {
+            let prev = enter(new_window(main));
+            show_folder(dir);
+            leave(prev);
+        }
+    }
+}
+
+/// Shows `dir` in the file tree and remembers it in File > Recently Opened.
+unsafe fn show_folder(dir: PathBuf) {
+    with(|s| add_recent_entry(s, &dir, true));
+    set_root(dir);
+    show_view(View::Files, true);
+}
+
+/// The title bar button: shows or hides the sidebar.
+unsafe fn toggle_sidebar() {
+    let (shown, view) = with(|s| (!s.win.side_shown, s.win.view));
+    if shown {
+        show_view(view, true);
+    } else {
+        with(|s| s.win.side_shown = false);
+        layout();
+        focus_tree(false);
+        schedule_save();
+    }
+}
+
+/// Ctrl+Shift+E: the files view, or hides the sidebar if it already shows them.
+unsafe fn toggle_files() {
+    if with(|s| s.win.side_shown && s.win.view == View::Files) {
+        toggle_sidebar();
+    } else {
+        show_view(View::Files, true);
+    }
+}
+
+/// Shows the sidebar with `view`, with the keyboard there if `focus`.
+unsafe fn show_view(view: View, focus: bool) {
+    with(|s| (s.win.side_shown, s.win.view) = (true, view));
+    layout();
+    if view == View::Files {
+        PostMessageW(with(|s| s.win.main), WM_TREE_REFRESH, 0, 0);
+    }
+    if focus {
+        focus_tree(true);
+    }
+    schedule_save();
+}
+
+/// Moves the keyboard to the sidebar's view or back to the editor.
+unsafe fn focus_tree(side: bool) {
+    let (main, view, tree, search, open_btn) = with(|s| (s.win.main, s.win.view, s.win.tree, s.win.search, s.win.open_btn));
+    if GetForegroundWindow() != main {
+        return;
+    }
+    if !side {
+        SetFocus(cur_edit());
+    } else if view == View::Search {
+        search::focus(search, &[], false);
+    } else if with(|s| s.win.root.is_some()) {
+        SetFocus(tree);
+    } else {
+        SetFocus(open_btn);
+    }
 }
 
 unsafe fn repaint_bar() {
@@ -1230,7 +1429,7 @@ unsafe fn paint_bar(h: HWND) {
         let tabs: Vec<(String, bool)> = s.win.tabs.iter().map(|t| (name(t), t.dirty)).collect();
         let look = titlebar::Look {
             font: s.ufont, icons: s.ifont, small_icons: s.ifont_small, dpi: s.dpi,
-            active: s.win.active, maximized: IsZoomed(h) != 0, hover: s.win.hover,
+            active: s.win.active, maximized: IsZoomed(h) != 0, hover: s.win.hover, tree_open: s.win.side_shown,
         };
         (tabs, s.win.cur, look)
     });
@@ -1243,6 +1442,33 @@ unsafe fn paint_bar(h: HWND) {
     let old = SelectObject(dc, bmp);
     paint_status(dc, w, sh);
     BitBlt(hdc, 0, rc.bottom - sh, w, sh, dc, 0, 0, SRCCOPY);
+    let split = splitter();
+    if split.right > 0 {
+        let c = theme::palette();
+        let (header, icons) = side_header();
+        let (view, ifont) = with(|s| (s.win.view, s.ifont_big));
+        for (r, color) in [(split, c.strip), (RECT { left: split.right - 1, ..split }, c.separator), (header, c.strip)] {
+            let b = CreateSolidBrush(color);
+            FillRect(hdc, &r, b);
+            DeleteObject(b);
+        }
+        // The view icons: files, search; the current one bright and underlined.
+        SelectObject(hdc, ifont);
+        SetBkMode(hdc, TRANSPARENT as _);
+        for (i, (r, glyph)) in icons.iter().zip(["\u{E8B7}", "\u{E721}"]).enumerate() {
+            let on = view == [View::Files, View::Search][i];
+            SetTextColor(hdc, if on { c.fg } else { c.status_fg });
+            let mut t = wide(glyph);
+            let mut rr = *r;
+            DrawTextW(hdc, t.as_mut_ptr(), -1, &mut rr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if on {
+                let b = CreateSolidBrush(0xD47800); // Windows blue
+                let w = r.right - r.left;
+                FillRect(hdc, &RECT { left: r.left + w / 4, top: r.bottom - 2, right: r.right - w / 4, bottom: r.bottom }, b);
+                DeleteObject(b);
+            }
+        }
+    }
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1270,8 +1496,33 @@ unsafe fn show_menu(key: Option<u16>) {
     }
     with(|s| s.win.hover = Hit::Menu);
     repaint_bar();
+    fill_recent_menu();
     TrackPopupMenuEx(menu, TPM_RIGHTALIGN | TPM_TOPALIGN, pt.x, pt.y, main, null());
     set_hover(Hit::None);
+}
+
+/// File > Recently Opened: the newest files and folders (as many as Ctrl+P lists).
+unsafe fn fill_recent_menu() {
+    let (menu, list) = with(|s| {
+        let list: Vec<(PathBuf, bool)> = s.recent.iter().take(s.max_recent).cloned().collect();
+        s.recent_shown = list.clone();
+        (s.recent_menu, list)
+    });
+    while GetMenuItemCount(menu) > 0 {
+        DeleteMenu(menu, 0, MF_BYPOSITION);
+    }
+    for (i, (p, dir)) in list.iter().enumerate() {
+        // Folders end in a backslash; "&" would underline the next letter.
+        let text = format!("{}{}", p.display(), if *dir { "\\" } else { "" }).replace('&', "&&");
+        let text = if i < 9 { format!("&{} {text}", i + 1) } else { text };
+        AppendMenuW(menu, MF_STRING, (ID_RECENT + i as u16) as usize, wide(&text).as_ptr());
+    }
+    if list.is_empty() {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("No recent files or folders"));
+    } else {
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING, ID_CLEAR_RECENT as usize, w!("&Clear Recently Opened"));
+    }
 }
 
 /// Thickness of the resize border hidden above the title bar.
@@ -1292,6 +1543,7 @@ unsafe fn refresh(i: usize) {
     repaint_bar();
     if is_cur {
         SetWindowTextW(main, wide(&title).as_ptr());
+        reveal_active();
     }
 }
 
@@ -1322,6 +1574,9 @@ unsafe fn select(i: usize) {
     }
     schedule_save();
     refresh(i);
+    if !findbar::open_bar(with(|s| s.win.main)).is_null() {
+        findbar::recount(with(|s| s.win.main));
+    }
 }
 
 unsafe fn add_tab(path: Option<PathBuf>, text: Vec<u16>, enc: Enc, lf: bool, dirty: bool) {
@@ -1355,21 +1610,42 @@ fn recent_path() -> Option<PathBuf> {
 }
 
 fn add_recent(s: &mut State, p: &PathBuf) {
-    s.recent.retain(|r| r != p);
-    s.recent.insert(0, p.clone());
-    s.recent.truncate(s.max_recent);
+    add_recent_entry(s, p, false);
+}
+
+fn add_recent_entry(s: &mut State, p: &PathBuf, dir: bool) {
+    s.recent.retain(|r| r.0 != *p);
+    s.recent.insert(0, (p.clone(), dir));
+    trim_recent(&mut s.recent, s.max_recent);
+}
+
+/// Keeps the newest `max` files and the newest `max` folders.
+fn trim_recent(list: &mut Vec<(PathBuf, bool)>, max: usize) {
+    let (mut files, mut dirs) = (0, 0);
+    list.retain(|r| {
+        let n = if r.1 { &mut dirs } else { &mut files };
+        *n += 1;
+        *n <= max
+    });
+}
+
+/// The recent list file: one path per line, folders marked with "D\t".
+fn parse_recent(text: &str) -> Vec<(PathBuf, bool)> {
+    text.lines().filter(|l| !l.is_empty())
+        .map(|l| l.strip_prefix("D\t").map_or((PathBuf::from(l), false), |d| (PathBuf::from(d), true)))
+        .collect()
 }
 
 fn load_recent() {
     let list = recent_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     with(|s| {
-        s.recent = list.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
-        s.recent.truncate(s.max_recent);
+        s.recent = parse_recent(&list);
+        trim_recent(&mut s.recent, s.max_recent);
     });
 }
 
 fn save_recent() {
-    let text: String = with(|s| s.recent.iter().map(|p| format!("{}\n", p.display())).collect());
+    let text: String = with(|s| s.recent.iter().map(|(p, dir)| format!("{}{}\n", if *dir { "D\t" } else { "" }, p.display())).collect());
     if let Some(p) = recent_path() {
         _ = std::fs::create_dir_all(p.parent().unwrap());
         _ = std::fs::write(p, text);
@@ -1386,20 +1662,60 @@ unsafe fn quick_open() {
         for w in std::iter::once(&s.win).chain(&s.parked) {
             for t in &w.tabs {
                 let (name, dir) = t.path.as_ref().map_or(("Untitled".into(), String::new()), split);
-                items.push(quick::Item { name, dir, open: true });
+                items.push(quick::Item { name, dir, group: quick::Group::Open });
                 picks.push(Pick::Tab(w.main, t.edit));
             }
         }
         let open: Vec<PathBuf> = std::iter::once(&s.win).chain(&s.parked).flat_map(|w| w.tabs.iter().filter_map(|t| t.path.clone())).collect();
-        for p in s.recent.iter().filter(|p| !open.contains(p)) {
+        for (p, _) in s.recent.iter().filter(|(p, dir)| !dir && !open.contains(p)) {
             let (name, dir) = split(p);
-            items.push(quick::Item { name, dir, open: false });
+            items.push(quick::Item { name, dir, group: quick::Group::Recent });
             picks.push(Pick::File(p.clone()));
         }
         (items, picks, s.win.main, s.ufont, s.dpi)
     });
     with(|s| s.quick = picks);
     quick::show(main, items, quick::Opts { font, dpi, top: bar_rects().height, pick: quick_pick, preview: None, cancel: None, selected: 0 });
+    // The open folder's files are listed in the background and added as they are found.
+    let search = QUICK_SEARCH.fetch_add(1, Relaxed) + 1;
+    if let Some(root) = with(|s| s.win.root.clone()) {
+        let main = main as isize;
+        std::thread::spawn(move || {
+            tree::walk(&root, || QUICK_SEARCH.load(Relaxed) == search, |files| unsafe {
+                let files = Box::into_raw(Box::new(files));
+                if PostMessageW(main as HWND, WM_QUICK_FILES, search as WPARAM, files as LPARAM) == 0 {
+                    drop(Box::from_raw(files));
+                }
+            });
+        });
+    }
+}
+
+/// A chunk of the open folder's files for the Ctrl+P list (see `quick_open`).
+unsafe fn quick_files(search: u32, files: Vec<PathBuf>) {
+    let Some(root) = with(|s| s.win.root.clone()) else { return };
+    if search != QUICK_SEARCH.load(Relaxed) || !quick::is_open() {
+        QUICK_SEARCH.fetch_add(1, Relaxed); // the popup is gone: stop the walk
+        return;
+    }
+    let top = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let items = with(|s| {
+        // Files already listed as open or recent are left out.
+        let listed: std::collections::HashSet<PathBuf> = s.quick.iter().filter_map(|p| match p {
+            Pick::Tab(_, e) => all_tabs(s).find(|t| t.edit == *e)?.path.clone(),
+            Pick::File(f) => Some(f.clone()),
+        }).collect();
+        let mut items = Vec::new();
+        for f in files.into_iter().filter(|f| !listed.contains(f)) {
+            let rel = f.parent().and_then(|d| d.strip_prefix(&root).ok()).map_or(String::new(), |d| d.display().to_string());
+            let dir = if rel.is_empty() { top.clone() } else { format!("{top}\\{rel}") };
+            let name = f.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            items.push(quick::Item { name, dir, group: quick::Group::Folder });
+            s.quick.push(Pick::File(f));
+        }
+        items
+    });
+    quick::add(items);
 }
 
 unsafe fn quick_pick(i: usize) {
@@ -1407,6 +1723,72 @@ unsafe fn quick_pick(i: usize) {
         Some(Pick::Tab(w, e)) => show_tab(w, e),
         Some(Pick::File(f)) => open_path(f),
         None => {}
+    }
+}
+
+/// Ctrl+F / Ctrl+H: the find bar over the editor, starting with the selection (if one line).
+unsafe fn find_bar(replace: bool) {
+    let (main, font, icons, edit) = with(|s| {
+        s.findbar_used = true;
+        (s.win.main, s.ufont, s.ifont, s.win.tabs.get(s.win.cur).map(|t| t.edit))
+    });
+    let initial = edit.map(|e| ed(e).text[ed(e).sel()].to_vec()).filter(|t| t.len() < 256 && !t.contains(&(b'\n' as u16))).unwrap_or_default();
+    findbar::show(main, font, icons, &initial, replace);
+}
+
+/// The current tab's editor of window `main`.
+fn editor_of(main: HWND) -> Option<HWND> {
+    with(|s| std::iter::once(&s.win).chain(&s.parked).find(|w| w.main == main).and_then(|w| w.tabs.get(w.cur)).map(|t| t.edit))
+}
+
+/// Ctrl+Shift+F / Ctrl+Shift+H: the sidebar's search view, starting with the selection.
+unsafe fn find_in_files(replace: bool) {
+    let (main, edit) = with(|s| (s.win.main, s.win.tabs.get(s.win.cur).map(|t| t.edit)));
+    // Starts with the selection when it is a single line.
+    let initial = edit.map(|e| ed(e).text[ed(e).sel()].to_vec()).filter(|t| t.len() < 256 && !t.contains(&(b'\n' as u16))).unwrap_or_default();
+    show_view(View::Search, false);
+    let panel = with(|s| s.win.search);
+    if GetForegroundWindow() == main {
+        search::focus(panel, &initial, replace);
+    }
+}
+
+/// What Find in Files searches: every open tab's text and the current window's folder.
+unsafe fn search_sources() -> (Vec<search::Tab>, Option<PathBuf>) {
+    let (tabs, root) = with(|s| {
+        let tabs: Vec<(Option<PathBuf>, HWND)> = all_tabs(s).map(|t| (t.path.clone(), t.edit)).collect();
+        (tabs, s.win.root.clone())
+    });
+    let tabs = tabs.into_iter().map(|(path, edit)| {
+        let label = match (&path, &root) {
+            (Some(p), Some(r)) if p.starts_with(r) => p.strip_prefix(r).map_or(String::new(), |x| x.display().to_string()),
+            (Some(p), _) => p.display().to_string(),
+            (None, _) => "Untitled".into(),
+        };
+        search::Tab { path, label, edit: edit as isize, text: ed(edit).text.clone() }
+    }).collect();
+    (tabs, root)
+}
+
+/// Shows a Find in Files match: its tab (or the file, opened) with the match selected.
+unsafe fn open_hit(hit: &search::Hit) {
+    let tab = with(|s| std::iter::once(&s.win).chain(&s.parked).find_map(|w| {
+        w.tabs.iter().find(|t| t.edit as isize == hit.edit).map(|t| (w.main, t.edit))
+    }));
+    let edit = match (tab, &hit.path) {
+        (Some((w, e)), _) => {
+            show_tab(w, e);
+            e
+        }
+        (None, Some(p)) => {
+            open_path(p.clone());
+            cur_edit()
+        }
+        (None, None) => return,
+    };
+    let e = ed(edit);
+    if hit.start + hit.len <= e.text.len() {
+        e.select(hit.start, hit.start + hit.len);
     }
 }
 
@@ -1419,7 +1801,7 @@ unsafe fn choose_scheme() {
             (true, false) => "dark only".into(),
             _ => "light only".into(),
         },
-        open: false,
+        group: quick::Group::Open,
     }).collect();
     let (main, font, dpi, current) = with(|s| (s.win.main, s.ufont, s.dpi, s.scheme.clone()));
     let selected = theme::SCHEMES.iter().position(|s| s.name == current).unwrap_or(0);
@@ -1485,21 +1867,24 @@ fn session_path() -> Option<PathBuf> {
 }
 
 /// Session format (version 2): header line, "font-pt", then per window a line
-/// "W current-tab maximized left top right bottom" followed by its tabs, each a line
+/// "W current-tab maximized left top right bottom", optionally "D shown width\tfolder" for its file tree,
+/// followed by its tabs, each a line
 /// "dirty enc lf len lang\tpath\n" and `len` bytes of UTF-8 text (only for dirty tabs).
 /// Version 1 (one window) is still read.
 unsafe fn save_session() {
     save_recent();
     let Some(p) = session_path() else { return };
     type TabInfo = (HWND, Option<PathBuf>, Enc, bool, Option<syntax::Lang>);
-    let (windows, pt): (Vec<(HWND, usize, Vec<TabInfo>)>, i32) = with(|s| {
+    type WinInfo = (HWND, usize, (Option<PathBuf>, bool, i32, View), Vec<TabInfo>);
+    let (windows, pt): (Vec<WinInfo>, i32) = with(|s| {
         let windows = std::iter::once(&s.win).chain(&s.parked).filter(|w| !w.tabs.is_empty())
-            .map(|w| (w.main, w.cur, w.tabs.iter().map(|t| (t.edit, t.path.clone(), t.enc, t.lf, t.lang)).collect()))
+            .map(|w| (w.main, w.cur, (w.root.clone(), w.side_shown, w.tree_w, w.view),
+                w.tabs.iter().map(|t| (t.edit, t.path.clone(), t.enc, t.lf, t.lang)).collect()))
             .collect();
         (windows, s.pt)
     });
     let mut out = format!("{APP}-session-2\n{pt}\n").into_bytes();
-    for (main, cur, tabs) in windows {
+    for (main, cur, tree, tabs) in windows {
         let mut wp: WINDOWPLACEMENT = zeroed();
         wp.length = size_of::<WINDOWPLACEMENT>() as u32;
         GetWindowPlacement(main, &mut wp);
@@ -1507,6 +1892,11 @@ unsafe fn save_session() {
             || (wp.showCmd == SW_SHOWMINIMIZED as _ && wp.flags & WPF_RESTORETOMAXIMIZED != 0);
         let RECT { left, top, right, bottom } = wp.rcNormalPosition;
         out.extend(format!("W {cur} {} {left} {top} {right} {bottom}\n", max as u8).bytes());
+        let (root, shown, width, view) = tree;
+        if root.is_some() || shown {
+            let root = root.map_or(String::new(), |r| r.display().to_string());
+            out.extend(format!("D {} {width} {}\t{root}\n", shown as u8, (view == View::Search) as u8).bytes());
+        }
         for (edit, path, enc, lf, lang) in tabs {
             let e = ed(edit);
             let body = if e.dirty() { String::from_utf16_lossy(&e.text) } else { String::new() };
@@ -1537,6 +1927,7 @@ struct SavedTab {
 struct SavedWindow {
     cur: usize,
     place: Option<(RECT, bool)>,
+    tree: Option<(Option<PathBuf>, bool, i32, View)>, // sidebar: folder, shown, width, view
     tabs: Vec<SavedTab>,
 }
 
@@ -1551,8 +1942,8 @@ fn parse_session(data: &[u8]) -> Option<(i32, Vec<SavedWindow>)> {
         l.split(' ').map(|x| x.parse().ok()).collect()
     }
     let window = |v: &[i32]| match *v {
-        [cur, max, left, top, right, bottom] => Some(SavedWindow { cur: cur.max(0) as usize, place: Some((RECT { left, top, right, bottom }, max == 1)), tabs: Vec::new() }),
-        [cur] => Some(SavedWindow { cur: cur.max(0) as usize, place: None, tabs: Vec::new() }),
+        [cur, max, left, top, right, bottom] => Some(SavedWindow { cur: cur.max(0) as usize, place: Some((RECT { left, top, right, bottom }, max == 1)), tree: None, tabs: Vec::new() }),
+        [cur] => Some(SavedWindow { cur: cur.max(0) as usize, place: None, tree: None, tabs: Vec::new() }),
         _ => None,
     };
     let mut rest = data;
@@ -1572,6 +1963,14 @@ fn parse_session(data: &[u8]) -> Option<(i32, Vec<SavedWindow>)> {
     while let Some(l) = line(&mut rest) {
         if let Some(w) = l.strip_prefix("W ") {
             windows.push(window(&nums(w)?)?);
+            continue;
+        }
+        if let Some(d) = l.strip_prefix("D ") {
+            let (meta, root) = d.split_once('\t')?;
+            let n: Vec<i32> = nums(meta)?;
+            let view = if n.get(2) == Some(&1) { View::Search } else { View::Files };
+            let root = (!root.is_empty()).then(|| PathBuf::from(root));
+            windows.last_mut()?.tree = Some((root, *n.first()? == 1, *n.get(1)?, view));
             continue;
         }
         let (meta, path) = l.split_once('\t')?;
@@ -1631,6 +2030,13 @@ unsafe fn restore_session() -> Option<()> {
         if n > 0 {
             select(w.cur.min(n - 1));
         }
+        if let Some((root, shown, width, view)) = w.tree {
+            with(|s| (s.win.tree_w, s.win.side_shown, s.win.view) = (width.max(80), shown, view));
+            if let Some(root) = root.filter(|r| r.is_dir()) {
+                set_root(root);
+            }
+            layout();
+        }
         if let Some(prev) = prev {
             if n == 0 {
                 DestroyWindow(h); // all its files are gone
@@ -1687,10 +2093,10 @@ unsafe fn open_path(p: PathBuf) {
     }
 }
 
-/// Shows the common file dialog. Open supports multi-select.
-unsafe fn file_dialog(save: bool, initial: Option<&PathBuf>) -> Vec<PathBuf> {
+/// Save As: asks for the file name.
+unsafe fn save_dialog(initial: Option<&PathBuf>) -> Option<PathBuf> {
     let main = with(|s| s.win.main);
-    let mut buf = vec![0u16; 65536];
+    let mut buf = vec![0u16; 32768];
     if let Some(p) = initial {
         let w = wide(&p.display().to_string());
         buf[..w.len()].copy_from_slice(&w);
@@ -1702,16 +2108,12 @@ unsafe fn file_dialog(save: bool, initial: Option<&PathBuf>) -> Vec<PathBuf> {
     ofn.lpstrFilter = filter.as_ptr();
     ofn.lpstrFile = buf.as_mut_ptr();
     ofn.nMaxFile = buf.len() as u32;
-    ofn.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR
-        | if save { OFN_OVERWRITEPROMPT } else { OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT };
-    if (if save { GetSaveFileNameW(&mut ofn) } else { GetOpenFileNameW(&mut ofn) }) == 0 {
-        return Vec::new();
+    ofn.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT;
+    if GetSaveFileNameW(&mut ofn) == 0 {
+        return None;
     }
-    // Multi-select yields "dir\0file1\0file2\0\0"; single yields "path\0\0".
-    let mut parts = buf.split(|&c| c == 0).take_while(|s| !s.is_empty()).map(String::from_utf16_lossy);
-    let first = PathBuf::from(parts.next().unwrap_or_default());
-    let rest: Vec<PathBuf> = parts.map(|f| first.join(f)).collect();
-    if rest.is_empty() { vec![first] } else { rest }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
 unsafe fn save(i: usize, save_as: bool) -> bool {
@@ -1721,7 +2123,7 @@ unsafe fn save(i: usize, save_as: bool) -> bool {
     });
     let path = match path.clone().filter(|_| !save_as) {
         Some(p) => p,
-        None => match file_dialog(true, path.as_ref()).pop() {
+        None => match save_dialog(path.as_ref()) {
             Some(p) => p,
             None => return false,
         },
@@ -1842,6 +2244,7 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             repaint_bar();
             if active {
                 PostMessageW(h, WM_TIMER, 1, 0); // check files once activation is done
+                PostMessageW(h, WM_TREE_REFRESH, 0, 0); // and show new or removed files in the tree
             }
             DefWindowProcW(h, m, wp, lp)
         }
@@ -1871,7 +2274,7 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         edit::CARET => {
             repaint_bar();
-            update_count();
+            findbar::show_count(h);
             0
         }
         WM_TIMER if wp == TIMER_SESSION => {
@@ -1948,6 +2351,61 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             set_hover(Hit::None);
             0
         }
+        // Dragging a file or folder in the tree onto another folder moves it.
+        WM_MOUSEMOVE if with(|s| s.win.tree_drag.is_some()) => {
+            let (tree, root) = with(|s| (s.win.tree, s.win.root.clone()));
+            let mut pt: POINT = zeroed();
+            GetCursorPos(&mut pt);
+            let target = root.and_then(|r| tree::drop_target(tree, &r, Some(pt)));
+            SetCursor(LoadCursorW(null_mut(), if target.is_some() { IDC_ARROW } else { IDC_NO }));
+            0
+        }
+        WM_LBUTTONUP if with(|s| s.win.tree_drag.is_some()) => {
+            let (tree, root, src) = with(|s| (s.win.tree, s.win.root.clone(), s.win.tree_drag.take()));
+            let mut pt: POINT = zeroed();
+            GetCursorPos(&mut pt);
+            ReleaseCapture();
+            if let (Some(root), Some(src)) = (root, src) {
+                let target = tree::drop_target(tree, &root, Some(pt));
+                tree::drop_target(tree, &root, None);
+                if let Some(dir) = target {
+                    move_path(&src, &dir);
+                }
+            }
+            0
+        }
+        WM_CAPTURECHANGED if with(|s| s.win.tree_drag.is_some()) => {
+            let (tree, root) = with(|s| (s.win.tree, s.win.root.clone()));
+            with(|s| s.win.tree_drag = None);
+            if let Some(root) = root {
+                tree::drop_target(tree, &root, None);
+            }
+            0
+        }
+        WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => {
+            let mut pt: POINT = zeroed();
+            GetCursorPos(&mut pt);
+            ScreenToClient(h, &mut pt);
+            let r = splitter();
+            if pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom {
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                return 1;
+            }
+            DefWindowProcW(h, m, wp, lp)
+        }
+        // Dragging the splitter resizes the file tree.
+        WM_MOUSEMOVE if with(|s| s.win.split.is_some()) => {
+            let x = (lp & 0xFFFF) as i16 as i32;
+            with(|s| s.win.tree_w = ((x - s.win.split.unwrap_or(0)) * 96 / s.dpi as i32).max(80));
+            layout();
+            0
+        }
+        WM_LBUTTONUP if with(|s| s.win.split.is_some()) => {
+            with(|s| s.win.split = None);
+            ReleaseCapture();
+            schedule_save();
+            0
+        }
         WM_MOUSEMOVE if with(|s| s.win.drag.is_some()) => {
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
             let d = with(|s| {
@@ -2014,6 +2472,17 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_LBUTTONDOWN | WM_MBUTTONUP => {
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            let r = splitter();
+            if m == WM_LBUTTONDOWN && x >= r.left && x < r.right && y >= r.top && y < r.bottom {
+                with(|s| s.win.split = Some(x - r.left));
+                SetCapture(h);
+                return 0;
+            }
+            let inside = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+            if let Some(i) = side_header().1.iter().position(inside).filter(|_| m == WM_LBUTTONDOWN && r.right > 0) {
+                show_view([View::Files, View::Search][i], true);
+                return 0;
+            }
             let mut rc: RECT = zeroed();
             GetClientRect(h, &mut rc);
             let y_status = y - (rc.bottom - status_height());
@@ -2035,6 +2504,7 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     SetCapture(h);
                 }
                 (WM_LBUTTONDOWN, Hit::NewTab) => new_tab(),
+                (WM_LBUTTONDOWN, Hit::Tree) => toggle_sidebar(),
                 (WM_LBUTTONDOWN, Hit::Menu) => show_menu(None),
                 (_, Hit::TabClose(i)) | (WM_MBUTTONUP, Hit::Tab(i)) => close_tab(i),
                 _ => {}
@@ -2056,10 +2526,15 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_COMMAND => {
             let (id, code) = ((wp & 0xFFFF) as u16, ((wp >> 16) & 0xFFFF) as u32);
+            if lp != 0 && lp as HWND == with(|s| s.win.open_btn) {
+                open_folder();
+                return 0;
+            }
             if lp != 0 {
                 // An editor changed: update its tab label when the modified state flipped.
                 if code == EN_CHANGE {
                     schedule_save();
+                    findbar::text_changed(h);
                     let e = lp as HWND;
                     if let Some(i) = try_with(|s| s.win.tabs.iter().position(|t| t.edit == e && t.dirty != ed(e).dirty())) {
                         refresh(i);
@@ -2071,7 +2546,19 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             match id {
                 ID_NEW => new_tab(),
                 ID_NEWWINDOW => _ = new_window(h),
-                ID_OPEN => file_dialog(false, None).into_iter().for_each(|p| open_path(p)),
+                ID_OPENFOLDER => open_folder(),
+                ID_CLEAR_RECENT => {
+                    with(|s| s.recent.clear());
+                    save_recent();
+                }
+                x if x >= ID_RECENT => match with(|s| s.recent_shown.get((x - ID_RECENT) as usize).cloned()) {
+                    Some((dir, true)) if dir.is_dir() => show_folder(dir),
+                    Some((dir, true)) => error(format!("{}\n\nThe folder does not exist.", dir.display())),
+                    Some((file, false)) => open_path(file),
+                    None => {}
+                },
+                ID_TREE => toggle_files(),
+                ID_OPEN => open_dialog(),
                 ID_SAVE => _ = save(cur, false),
                 ID_SAVEAS => _ = save(cur, true),
                 ID_CLOSE => close_tab(cur),
@@ -2081,10 +2568,20 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     let e = ed(cur_edit());
                     e.select(0, e.text.len());
                 }
-                ID_EXIT => _ = SendMessageW(h, WM_CLOSE, 0, 0),
-                ID_FIND => find_dialog(false),
-                ID_REPLACE => find_dialog(true),
-                ID_FINDNEXT => find_again(),
+                ID_EXIT => exit_app(),
+                ID_FIND => find_bar(false),
+                ID_FINDFILES => find_in_files(false),
+                ID_REPLACEFILES => find_in_files(true),
+                ID_REPLACE => find_bar(true),
+                ID_FINDNEXT | ID_FINDPREV => {
+                    // Without a search yet: the find bar.
+                    if findbar::open_bar(h).is_null() && !with(|s| s.findbar_used) {
+                        find_bar(false);
+                    } else {
+                        findbar::recount(h);
+                        findbar::go(h, id == ID_FINDPREV);
+                    }
+                }
                 ID_SETTINGS => open_settings(),
                 ID_REOPEN => reopen_tab(),
                 ID_GOTO => go_to_line(),
@@ -2141,6 +2638,37 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             }
             0
         }
+        WM_NOTIFY => {
+            let from = (*(lp as *const NMHDR)).hwndFrom;
+            let Some((tree, root)) = with(|s| s.win.root.clone().map(|r| (s.win.tree, r))).filter(|t| t.0 == from) else {
+                return DefWindowProcW(h, m, wp, lp);
+            };
+            let (r, action) = tree::notify(tree, &root, lp);
+            match action {
+                tree::Action::None => {}
+                tree::Action::Open(f) => open_path(f),
+                tree::Action::Rename(path, name) => rename_path(&path, &name),
+                tree::Action::Menu(path, top, pt) => tree_menu(path, top, pt),
+                tree::Action::Drag(path) => {
+                    with(|s| s.win.tree_drag = Some(path));
+                    SetCapture(h);
+                }
+            }
+            r
+        }
+        WM_QUICK_FILES => {
+            let files = *Box::from_raw(lp as *mut Vec<PathBuf>);
+            quick_files(wp as u32, files);
+            0
+        }
+        WM_TREE_REFRESH => {
+            if let Some((tree, root)) = with(|s| s.win.root.clone().filter(|_| s.win.side_shown && s.win.view == View::Files).map(|r| (s.win.tree, r))) {
+                tree::refresh(tree, &root);
+                with(|s| s.win.revealed = None); // the active file may have been renamed or moved
+                reveal_active();
+            }
+            0
+        }
         WM_CLOSE_EMPTY => {
             if with(|s| s.win.tabs.is_empty()) {
                 DestroyWindow(h);
@@ -2167,10 +2695,6 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             }
             0
         }
-        _ if m == FINDMSG.load(Relaxed) => {
-            on_find(lp as *const FINDREPLACEW);
-            0
-        }
         _ => DefWindowProcW(h, m, wp, lp),
     }
 }
@@ -2182,6 +2706,7 @@ fn accelerators() -> Vec<ACCEL> {
         ACCEL { fVirt: c, key: b'T' as u16, cmd: ID_NEW },
         ACCEL { fVirt: c, key: b'N' as u16, cmd: ID_NEW },
         ACCEL { fVirt: cs, key: b'N' as u16, cmd: ID_NEWWINDOW },
+        ACCEL { fVirt: cs, key: b'E' as u16, cmd: ID_TREE },
         ACCEL { fVirt: c, key: b'O' as u16, cmd: ID_OPEN },
         ACCEL { fVirt: c, key: b'S' as u16, cmd: ID_SAVE },
         ACCEL { fVirt: cs, key: b'S' as u16, cmd: ID_SAVEAS },
@@ -2190,7 +2715,10 @@ fn accelerators() -> Vec<ACCEL> {
         ACCEL { fVirt: c, key: b'A' as u16, cmd: ID_SELALL },
         ACCEL { fVirt: c, key: b'F' as u16, cmd: ID_FIND },
         ACCEL { fVirt: c, key: b'H' as u16, cmd: ID_REPLACE },
+        ACCEL { fVirt: cs, key: b'F' as u16, cmd: ID_FINDFILES },
+        ACCEL { fVirt: cs, key: b'H' as u16, cmd: ID_REPLACEFILES },
         ACCEL { fVirt: FVIRTKEY, key: VK_F3, cmd: ID_FINDNEXT },
+        ACCEL { fVirt: FSHIFT | FVIRTKEY, key: VK_F3, cmd: ID_FINDPREV },
         ACCEL { fVirt: FALT | FVIRTKEY, key: b'Z' as u16, cmd: ID_WRAP },
         ACCEL { fVirt: c, key: b'G' as u16, cmd: ID_GOTO },
         ACCEL { fVirt: c, key: b'P' as u16, cmd: ID_QUICKOPEN },
@@ -2271,6 +2799,8 @@ fn main() {
                 (ID_NEWWINDOW, "New &Window\tCtrl+Shift+N"),
                 (ID_OPEN, "&Open...\tCtrl+O"),
                 (ID_QUICKOPEN, "&Quick Open...\tCtrl+P"),
+                (ID_TREE, "File &Tree\tCtrl+Shift+E"),
+                (ID_RECENT, "Recently Op&ened"), // a submenu, see below
                 (ID_SAVE, "&Save\tCtrl+S"),
                 (ID_SAVEAS, "Save &As...\tCtrl+Shift+S"),
                 (ID_CLOSE, "&Close Tab\tCtrl+W"),
@@ -2282,6 +2812,8 @@ fn main() {
                 (ID_FIND, "&Find...\tCtrl+F"),
                 (ID_FINDNEXT, "Find &Next\tF3"),
                 (ID_REPLACE, "&Replace...\tCtrl+H"),
+                (ID_FINDFILES, "Find &in Files...\tCtrl+Shift+F"),
+                (ID_REPLACEFILES, "Replace in Fi&les...\tCtrl+Shift+H"),
                 (0, ""),
                 (ID_SELALL, "Select &All\tCtrl+A"),
                 (ID_WRAP, "&Word Wrap\tAlt+Z"),
@@ -2299,6 +2831,10 @@ fn main() {
             for &(id, text) in items {
                 if id == 0 {
                     AppendMenuW(popup, MF_SEPARATOR, 0, null());
+                } else if id == ID_RECENT {
+                    let recent = CreatePopupMenu();
+                    with(|s| s.recent_menu = recent);
+                    AppendMenuW(popup, MF_POPUP, recent as usize, wide(text).as_ptr());
                 } else {
                     AppendMenuW(popup, MF_STRING, id as usize, wide(text).as_ptr());
                 }
@@ -2311,19 +2847,8 @@ fn main() {
         AppendMenuW(settings, MF_STRING, ID_SCHEME as usize, w!("&Color Scheme...\tCtrl+K Ctrl+T"));
         AppendMenuW(bar, MF_POPUP, settings as usize, w!("&Settings"));
         with(|s| s.menu = bar);
-        FINDMSG.store(RegisterWindowMessageW(FINDMSGSTRINGW), Relaxed);
 
         let hwnd = create_window();
-
-        let mut fr: FINDREPLACEW = zeroed();
-        fr.lStructSize = size_of::<FINDREPLACEW>() as u32;
-        fr.hwndOwner = hwnd;
-        fr.Flags = FR_DOWN | FR_ENABLEHOOK;
-        fr.lpfnHook = Some(find_hook);
-        fr.lpstrFindWhat = Box::leak(Box::new([0u16; 256])).as_mut_ptr();
-        fr.lpstrReplaceWith = Box::leak(Box::new([0u16; 256])).as_mut_ptr();
-        (fr.wFindWhatLen, fr.wReplaceWithLen) = (256, 256);
-        with(|s| s.fr = Box::into_raw(Box::new(fr)));
 
         let accels = accelerators();
         let haccel = CreateAcceleratorTableW(accels.as_ptr(), accels.len() as i32);
@@ -2351,11 +2876,24 @@ fn main() {
             if !settings_window.is_null() && IsDialogMessageW(settings_window, &msg) != 0 {
                 continue;
             }
-            let dlg = with(|s| s.fdlg);
-            if !dlg.is_null() && IsDialogMessageW(dlg, &msg) != 0 {
-                continue;
+            // The sidebar's search view and the find bar: Tab moves between their fields, Enter searches,
+            // Esc leaves.
+            let panel = with(|s| s.win.search);
+            let panel = if search::owns(panel, msg.hwnd) { panel } else { findbar::owner_bar(msg.hwnd) };
+            if !panel.is_null() {
+                // Shortcuts like Ctrl+Shift+E still work there; editing keys stay with the fields.
+                let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                let editing = matches!(msg.wParam as u8, b'A' | b'C' | b'V' | b'X' | b'Z' | b'Y')
+                    || matches!(msg.wParam as VIRTUAL_KEY, VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_BACK | VK_DELETE);
+                let f_key = msg.wParam as VIRTUAL_KEY == VK_F3;
+                if msg.message == WM_KEYDOWN && ((ctrl && !editing) || f_key) && TranslateAcceleratorW(with(|s| s.win.main), haccel, &msg) != 0 {
+                    continue;
+                }
+                if IsDialogMessageW(panel, &msg) != 0 {
+                    continue;
+                }
             }
-            // Ctrl+K Ctrl+T (a chord, as in VS Code): the color scheme picker.
+            // Ctrl+K Ctrl+T / Ctrl+K Ctrl+O (chords, as in VS Code): color scheme picker, open folder.
             if msg.message == WM_KEYDOWN && !matches!(msg.wParam as VIRTUAL_KEY, VK_CONTROL | VK_SHIFT | VK_MENU) {
                 let ctrl = GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_SHIFT as i32) >= 0;
                 if std::mem::take(&mut chord) {
@@ -2363,8 +2901,36 @@ fn main() {
                         choose_scheme();
                         continue;
                     }
+                    if ctrl && msg.wParam == b'O' as usize {
+                        open_folder();
+                        continue;
+                    }
                 } else if ctrl && msg.wParam == b'K' as usize {
                     chord = true;
+                    continue;
+                }
+            }
+            // In the file tree, F2 renames and Del deletes.
+            if msg.message == WM_KEYDOWN && matches!(msg.wParam as VIRTUAL_KEY, VK_F2 | VK_DELETE) {
+                if let Some((tree, root)) = with(|s| s.win.root.clone().map(|r| (s.win.tree, r))).filter(|t| t.0 == msg.hwnd) {
+                    if msg.wParam == VK_F2 as usize {
+                        tree::edit_name(tree);
+                    } else if let Some((path, false)) = tree::selected(tree, &root) {
+                        delete_path(&path);
+                    }
+                    continue;
+                }
+            }
+            // In the file tree, Enter opens the file (or folder) and Esc goes back to the editor.
+            if msg.message == WM_KEYDOWN && matches!(msg.wParam as VIRTUAL_KEY, VK_RETURN | VK_ESCAPE) {
+                if let Some((tree, root)) = with(|s| s.win.root.clone().map(|r| (s.win.tree, r))).filter(|t| t.0 == msg.hwnd) {
+                    if msg.wParam == VK_RETURN as usize {
+                        if let Some(f) = tree::enter(tree, &root) {
+                            open_path(f);
+                        }
+                    } else {
+                        focus_tree(false);
+                    }
                     continue;
                 }
             }
@@ -2377,7 +2943,11 @@ fn main() {
             // Ctrl+wheel zooms instead of scrolling.
             if msg.message == WM_MOUSEWHEEL && GetKeyState(VK_CONTROL as i32) < 0 {
                 zoom((msg.wParam >> 16) as i16 as i32);
-            } else if TranslateAcceleratorW(hwnd, haccel, &msg) == 0 {
+            } else if GetParent(msg.hwnd) == with(|s| s.win.tree) && !msg.hwnd.is_null() {
+                // Typing a new name in the tree: Ctrl+A, Ctrl+Z and friends belong to the name box.
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else if TranslateAcceleratorW(with(|s| s.win.main), haccel, &msg) == 0 { // the active window
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -2422,6 +2992,11 @@ mod tests {
         assert_eq!((w[0].tabs.len(), w[1].tabs.len(), w[1].cur), (1, 2, 1));
         assert!(w[0].place.unwrap().1);
         assert_eq!(w[1].place.unwrap().0.left, 5);
+        // A window's file tree.
+        let (_, w) = parse_session(b"minedit-session-2\n11\nW 0 0 1 2 3 4\nD 1 300\tC:\\my dir\n0 0 0 0 0\tC:\\x\n").unwrap();
+        assert_eq!((w[0].tree.clone(), w[0].tabs.len()), (Some((Some(PathBuf::from("C:\\my dir")), true, 300, View::Files)), 1));
+        let (_, w) = parse_session(b"minedit-session-2\n11\nW 0 0 1 2 3 4\nD 1 260 1\t\n0 0 0 0 0\tC:\\x\n").unwrap();
+        assert_eq!(w[0].tree.clone(), Some((None, true, 260, View::Search)));
         assert!(parse_session(b"something else\n").is_none());
     }
 
@@ -2432,6 +3007,33 @@ mod tests {
         assert_eq!(parse_goto("3,4"), Some((3, 4)));
         assert_eq!(parse_goto("x"), None);
         assert_eq!(parse_goto("1:2:3"), None);
+    }
+
+    /// Rename and move through the shell (no Recycle Bin: deleting is left out).
+    #[test]
+    fn shell_rename_and_move() {
+        let d = std::env::temp_dir().join(format!("minedit-shell-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.txt"), "x").unwrap();
+        unsafe {
+            assert!(shell_op(FO_RENAME, &d.join("a.txt"), Some(&d.join("b.txt"))));
+            assert!(shell_op(FO_MOVE, &d.join("b.txt"), Some(&d.join("sub"))));
+        }
+        assert_eq!(std::fs::read_to_string(d.join("sub").join("b.txt")).unwrap(), "x");
+        assert!(!d.join("a.txt").exists() && !d.join("b.txt").exists());
+        _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn recent_files_and_folders() {
+        let list = parse_recent("C:\\a.txt\nD\tC:\\proj\n\nC:\\b.txt\nD\tC:\\old\n");
+        assert_eq!(list[1], (PathBuf::from("C:\\proj"), true));
+        assert_eq!(list[2], (PathBuf::from("C:\\b.txt"), false));
+        // The limit counts files and folders separately.
+        let mut l = list.clone();
+        trim_recent(&mut l, 1);
+        assert_eq!(l, [list[0].clone(), list[1].clone()]);
     }
 
     #[test]

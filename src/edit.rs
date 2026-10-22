@@ -271,7 +271,7 @@ pub unsafe fn register() {
 }
 
 pub unsafe fn create(parent: HWND) -> HWND {
-    let h = CreateWindowExW(0, w!("minedit_text"), null(), WS_CHILD | WS_VSCROLL | WS_HSCROLL,
+    let h = CreateWindowExW(0, w!("minedit_text"), null(), WS_CHILD | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS,
         0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
     let e = Box::new(Editor {
         h, text: Vec::new(), lines: vec![0], sels: vec![Sel::at(0)], main: 0, undo: Vec::new(), redo: Vec::new(),
@@ -335,6 +335,11 @@ impl Editor {
     pub unsafe fn replace(&mut self, r: Range<usize>, t: Vec<u16>) {
         (self.sels, self.main) = (vec![Sel { a: r.start, h: r.end, x: -1 }], 0);
         self.change(vec![(r, t)], true, false);
+    }
+
+    /// Replaces several ranges of the current text, each with its own text, as one undo step.
+    pub unsafe fn replace_each(&mut self, changes: Vec<(Range<usize>, Vec<u16>)>) {
+        self.change(changes, false, false);
     }
 
     /// Replaces `text[at..at + del]` with `ins`, updating the line index in place (no full rescan);

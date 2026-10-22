@@ -10,9 +10,10 @@ $ErrorActionPreference = "Stop"
 $dir = Join-Path $env:LOCALAPPDATA "Programs\minedit"
 New-Item -ItemType Directory -Force $dir | Out-Null
 $exe = Join-Path $dir "minedit.exe"
-# Close running copies the normal way, so they save their session.
+# Close running copies with File > Exit (all windows, session saved).
+Add-Type -Namespace Win -Name User32 -MemberDefinition "[DllImport(`"user32.dll`")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);"
 $running = @(Get-Process minedit -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dir\*" })
-$running | ForEach-Object { [void]$_.CloseMainWindow() }
+$running | ForEach-Object { [void][Win.User32]::PostMessageW($_.MainWindowHandle, 0x111, [IntPtr]9, [IntPtr]::Zero) }
 $closed = @($running | Where-Object { $_.WaitForExit(10000) }).Count -eq $running.Count
 # A running exe cannot be overwritten but can be renamed; the old copy is removed on a later install.
 Remove-Item "$exe.old" -ErrorAction SilentlyContinue

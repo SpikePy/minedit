@@ -14,11 +14,14 @@ use windows_sys::{
 
 pub const GROUPS: [(&str, &[(&str, &str)]); 6] = [
     ("Files", &[
-        ("Ctrl+O", "Open"),
-        ("Ctrl+P", "Quick open: open and recent files"),
+        ("Ctrl+O", "Open files or a folder"),
+        ("Ctrl+P", "Quick open: open, recent, folder files"),
+        ("Ctrl+K Ctrl+O", "Open folder in the file tree"),
         ("Ctrl+S", "Save"),
         ("Ctrl+Shift+S", "Save as"),
         ("Drag files onto the window", "Open them"),
+        ("F2 / Del in the file tree", "Rename / delete"),
+        ("Drag in the file tree", "Move to another folder"),
     ]),
     ("Tabs and windows", &[
         ("Ctrl+T, Ctrl+N", "New tab"),
@@ -54,8 +57,10 @@ pub const GROUPS: [(&str, &[(&str, &str)]); 6] = [
     ]),
     ("Navigation and search", &[
         ("Ctrl+G", "Go to line"),
-        ("Ctrl+F / F3", "Find / find next"),
-        ("Ctrl+H", "Replace"),
+        ("Ctrl+F, Ctrl+H", "Find / replace bar"),
+        ("F3 / Shift+F3, Enter / Shift+Enter", "Next / previous match"),
+        ("Ctrl+Shift+F", "Sidebar: search tabs and folder"),
+        ("Ctrl+Shift+H", "Sidebar: replace in tabs and folder"),
         ("Ctrl+Left / Right", "Previous / next word"),
         ("Home / End", "Line start / end"),
         ("Ctrl+Home / End", "Start / end of file"),
@@ -65,6 +70,7 @@ pub const GROUPS: [(&str, &[(&str, &str)]); 6] = [
     ("View", &[
         ("Alt", "Menu"),
         ("Alt+Z", "Word wrap"),
+        ("Ctrl+Shift+E", "Sidebar: files"),
         ("Ctrl+K Ctrl+T", "Color scheme"),
         ("Ctrl+,", "Settings"),
         ("Ctrl+wheel", "Font size"),
