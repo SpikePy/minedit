@@ -1899,6 +1899,50 @@ mod tests {
         }
     }
 
+    /// Renders a sample in every color scheme variant (MINEDIT_RENDER_SCHEMES=<dir>) for a visual check.
+    #[test]
+    fn render_schemes() {
+        let Ok(dir) = std::env::var("MINEDIT_RENDER_SCHEMES") else { return };
+        let text = "# config loader\ndef load(path, retries=3):\n    \"\"\"Read the file.\"\"\"\n    if path is None:\n        return {'ok': False}\n";
+        for (k, s) in crate::theme::SCHEMES.iter().enumerate() {
+            for (dark, base) in [(true, &s.dark), (false, &s.light)] {
+                if base.is_none() {
+                    continue;
+                }
+                crate::theme::apply(s.name, dark);
+                unsafe {
+                    let e = editor(text);
+                    e.set_lang(Lang::Python);
+                    let face: Vec<u16> = "Consolas".encode_utf16().chain(Some(0)).collect();
+                    let font = CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, CLEARTYPE_QUALITY as _, 0, face.as_ptr());
+                    set_view(font, &Options { margin: 6, ..opts(false) });
+                    let (w, h) = (330, 110);
+                    MoveWindow(e.h, 0, 0, w, h, 0);
+                    (e.focus, e.sels) = (true, vec![Sel { a: 27, h: 31, x: -1 }]); // "path" selected, line 2 current
+                    let dc = CreateCompatibleDC(null_mut());
+                    let mut bits = null_mut();
+                    let mut bi: BITMAPINFO = zeroed();
+                    bi.bmiHeader = BITMAPINFOHEADER { biSize: 40, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..zeroed() };
+                    let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+                    SelectObject(dc, bmp);
+                    e.draw(dc, w, h);
+                    GdiFlush();
+                    let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+                    let mut f = b"BM".to_vec();
+                    f.extend((54 + px.len() as u32).to_le_bytes());
+                    f.extend([0u8; 4]);
+                    f.extend([54u32, 40].iter().flat_map(|v| v.to_le_bytes()));
+                    f.extend([w, -h].iter().flat_map(|v| v.to_le_bytes()));
+                    f.extend([1u16, 32].iter().flat_map(|v| v.to_le_bytes()));
+                    f.extend([0u8; 24]);
+                    f.extend(px);
+                    let file = format!("{dir}\\{k:02}_{}_{}.bmp", s.name.replace(' ', "-"), if dark { "dark" } else { "light" });
+                    std::fs::write(file, f).unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn crlf_round_trip() {
         let t: Vec<u16> = "a\r\nb\nc".encode_utf16().collect();

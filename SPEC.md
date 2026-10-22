@@ -17,7 +17,11 @@
 - open files (dialog, multi-select, drag and drop, command line)
 - Ctrl+P: fuzzy search over open files (file name first, then path) and,
   below a line, recently opened files (count set in the settings, default 20)
-- one window: files opened while minedit runs become tabs in that window
+- one process, many windows: files opened while minedit runs become tabs in
+  its frontmost window on the current virtual desktop (a new window if there
+  is none there); starting minedit without files while it runs (Start menu,
+  middle-click on the taskbar button) opens a new window on the current
+  desktop; Ctrl+Shift+N opens a new window
 - Explorer integration: "Open with" for every file type and an
   "Edit with minedit" entry in the right-click menu
 - save files (Save / Save As), keeping the file's encoding and line endings
@@ -48,6 +52,8 @@
   the last 2 seconds
 - restore window size, position and maximized state
 - light and dark theme, following the Windows app setting by default
+- 29 color schemes (the 20 most popular families, e.g. One Dark, Dracula,
+  Monokai, Solarized, Catppuccin); Ctrl+K Ctrl+T picker with live preview
   (title bar, text, status bar, scrollbars, menus)
 - status bar: line and column (click: go to line), word wrap (click to
   toggle), encoding and line endings (click to change for saving),
@@ -82,8 +88,8 @@
   JavaScript/TypeScript
 
 ## Settings
-- Settings opens `settings.ini` in a tab; saving it (Ctrl+S) applies it
-- options: font, size, tab width, insert spaces or tabs,
-  line numbers on/off, current-line highlight on/off,
-  inner margin, word wrap, auto-close brackets, theme (system/light/dark),
-  number of recent files
+- Ctrl+, opens a settings window with dropdowns (font, size, theme, color
+  scheme, tab width, margin, recent files) and toggle switches (spaces for
+  Tab, word wrap, line numbers, current-line highlight, auto-close brackets);
+  changes apply immediately
+- values are stored in `settings.ini`, which can still be opened as a tab

@@ -22,6 +22,8 @@ pub const GROUPS: [(&str, &[(&str, &str)]); 6] = [
     ]),
     ("Tabs and windows", &[
         ("Ctrl+T, Ctrl+N", "New tab"),
+        ("Ctrl+Shift+N", "New window"),
+        ("Middle-click taskbar button", "New window"),
         ("Ctrl+W, middle-click", "Close tab"),
         ("Ctrl+Shift+T", "Reopen closed tab"),
         ("Ctrl+Tab, Ctrl+PgDn", "Next tab"),
@@ -63,6 +65,8 @@ pub const GROUPS: [(&str, &[(&str, &str)]); 6] = [
     ("View", &[
         ("Alt", "Menu"),
         ("Alt+Z", "Word wrap"),
+        ("Ctrl+K Ctrl+T", "Color scheme"),
+        ("Ctrl+,", "Settings"),
         ("Ctrl+wheel", "Font size"),
         ("Ctrl+0, Ctrl+Num0", "Reset font size"),
         ("Ctrl+/", "This overview"),

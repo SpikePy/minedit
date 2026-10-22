@@ -23,15 +23,20 @@ the plain Win32 API: one ~400 KB `.exe`, no runtime, no DLLs to install.
 - **Syntax highlighting** for YAML, JSON, CSV, Markdown, INI, TOML, XML,
   Bash, PowerShell, Python and JavaScript/TypeScript
 - **Word wrap**, line numbers, current-line highlight, configurable margin
-- **Light and dark theme**, following Windows by default
+- **Light and dark theme**, following Windows by default, with 29 color
+  schemes from the most popular families (One Dark, Dracula, GitHub, Monokai,
+  Solarized, Material, Catppuccin, Tokyo Night, Gruvbox, Nord, Ayu, Darcula,
+  Rosé Pine, Kanagawa, …) — pick with live preview via Ctrl+K Ctrl+T
 - **Find and replace** with a match counter
 - **Detects files changed by other programs** and reloads them
 - Keeps each file's encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI)
   and line endings (CRLF/LF)
 - Status bar with line/column, word wrap, encoding, line endings and
   language — click any of them to change it
-- **One window**: files opened from Explorer while minedit runs open as tabs;
-  "Open with" and "Edit with minedit" entries are added by the installer
+- **Multiple windows**: Ctrl+Shift+N or middle-click on the taskbar button
+  opens a new window on the current virtual desktop; files opened from
+  Explorer become tabs in the frontmost window on that desktop. "Open with"
+  and "Edit with minedit" entries are added by the installer
 - Settings in a plain `settings.ini`, edited in a tab
 
 ## Keyboard shortcuts
@@ -46,6 +51,7 @@ Press **Ctrl+/** in minedit for an overview of all shortcuts.
 | Ctrl+S / Ctrl+Shift+S | Save / Save As |
 | Ctrl+W, middle-click a tab | Close tab |
 | Ctrl+Shift+T | Reopen closed tab |
+| Ctrl+Shift+N | New window |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Alt+1 … Alt+9 | Go to tab 1–9 |
 | Alt | Open the menu |
@@ -61,26 +67,19 @@ Press **Ctrl+/** in minedit for an overview of all shortcuts.
 | Tab / Shift+Tab | Indent / unindent selected lines |
 | Ctrl+F / F3 / Ctrl+H | Find / find next / replace |
 | Alt+Z | Toggle word wrap |
+| Ctrl+K Ctrl+T | Color scheme (live preview) |
+| Ctrl+, | Settings |
 | Ctrl+mouse wheel / Ctrl+0 | Font size / reset font size |
 
 ## Settings
 
-Open **≡ → Settings** to edit `%LOCALAPPDATA%\minedit\settings.ini`;
-saving it (Ctrl+S) applies the changes immediately.
+Press **Ctrl+,** (or **≡ → Settings**) for the settings window: dropdowns for
+font, size, theme, color scheme, tab width, margin and the number of recent
+files, and switches for spaces instead of tabs, word wrap, line numbers,
+current-line highlight and auto-closing brackets. Changes apply immediately.
 
-```ini
-font = Consolas
-size = 11
-tab_width = 4
-use_spaces = false
-line_numbers = true
-highlight_line = true
-margin = 8
-word_wrap = false
-auto_close = true
-theme = system   # system, light or dark
-recent_files = 20
-```
+They are stored in `%LOCALAPPDATA%\minedit\settings.ini`, which **Open settings
+file** shows in a tab for editing by hand.
 
 ## Building
 

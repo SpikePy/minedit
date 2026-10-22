@@ -19,6 +19,17 @@ pub struct Item {
     pub open: bool, // an open tab (listed first) rather than a recent file
 }
 
+/// How the list behaves.
+pub struct Opts {
+    pub font: HFONT,
+    pub dpi: u32,
+    pub top: i32,                       // distance from the owner's top edge
+    pub pick: unsafe fn(usize),         // Enter or click on an item
+    pub preview: Option<unsafe fn(usize)>, // the highlighted item changed
+    pub cancel: Option<unsafe fn()>,    // closed without picking
+    pub selected: usize,                // item highlighted at the start
+}
+
 struct Quick {
     popup: HWND,
     input: HWND,
@@ -29,6 +40,9 @@ struct Quick {
     font: HFONT,
     brush: HBRUSH, // input background
     pick: unsafe fn(usize),
+    preview: Option<unsafe fn(usize)>,
+    cancel: Option<unsafe fn()>,
+    picked: bool,
 }
 
 thread_local! {
@@ -79,8 +93,9 @@ pub fn filter(items: &[Item], query: &str) -> Vec<usize> {
 }
 
 /// Opens the popup over `owner`; `pick` is called with the chosen item's index.
-pub unsafe fn show(owner: HWND, items: Vec<Item>, font: HFONT, dpi: u32, top: i32, pick: unsafe fn(usize)) {
+pub unsafe fn show(owner: HWND, items: Vec<Item>, o: Opts) {
     close();
+    let Opts { font, dpi, top, pick, preview, cancel, selected } = o;
     let p = |v| px(v, dpi);
     let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: GetModuleHandleW(null()), lpszClassName: w!("minedit_quick"),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW), ..zeroed() };
@@ -95,11 +110,32 @@ pub unsafe fn show(owner: HWND, items: Vec<Item>, font: HFONT, dpi: u32, top: i3
     SendMessageW(input, WM_SETFONT, font as WPARAM, 0);
     SetWindowSubclass(input, Some(input_proc), 1, 0);
     let shown = filter(&items, "");
+    let sel = shown.iter().position(|&i| i == selected).unwrap_or(0);
     let brush = CreateSolidBrush(theme::palette().strip);
-    QUICK.with(|q| *q.borrow_mut() = Some(Quick { popup, input, items, shown, sel: 0, top: 0, font, brush, pick }));
+    QUICK.with(|q| *q.borrow_mut() = Some(Quick { popup, input, items, shown, sel, top: sel.saturating_sub(ROWS - 1), font, brush, pick, preview, cancel, picked: false }));
     resize();
     ShowWindow(popup, SW_SHOW);
     SetFocus(input);
+}
+
+/// Repaints the popup in the current theme (after a live preview changed it).
+pub unsafe fn recolor() {
+    QUICK.with(|q| {
+        if let Some(q) = q.borrow_mut().as_mut() {
+            DeleteObject(q.brush);
+            q.brush = CreateSolidBrush(theme::palette().strip);
+            InvalidateRect(q.popup, null(), 1);
+            InvalidateRect(q.input, null(), 1);
+        }
+    });
+}
+
+/// Tells the caller which item is highlighted now.
+unsafe fn previewed() {
+    let call = QUICK.with(|q| q.borrow().as_ref().and_then(|q| Some((q.preview?, *q.shown.get(q.sel)?))));
+    if let Some((f, i)) = call {
+        f(i);
+    }
 }
 
 pub unsafe fn close() {
@@ -135,6 +171,7 @@ unsafe fn refilter() {
         }
     });
     resize();
+    previewed();
 }
 
 /// Moves the selection by `d` rows, keeping it visible.
@@ -149,10 +186,12 @@ unsafe fn move_sel(d: isize) {
             InvalidateRect(q.popup, null(), 0);
         }
     });
+    previewed();
 }
 
 unsafe fn choose(row: usize) {
     let Some((item, pick)) = QUICK.with(|q| q.borrow().as_ref().and_then(|q| q.shown.get(row).map(|&i| (i, q.pick)))) else { return };
+    QUICK.with(|q| q.borrow_mut().as_mut().map(|q| q.picked = true));
     close();
     pick(item);
 }
@@ -239,11 +278,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             0
         }
         WM_DESTROY => {
-            QUICK.with(|q| {
-                if let Some(q) = q.borrow_mut().take() {
-                    DeleteObject(q.brush);
-                }
+            let cancel = QUICK.with(|q| {
+                let q = q.borrow_mut().take()?;
+                DeleteObject(q.brush);
+                if q.picked { None } else { q.cancel }
             });
+            if let Some(f) = cancel {
+                f();
+            }
             0
         }
         _ => DefWindowProcW(h, m, wp, lp),

@@ -3,14 +3,16 @@
 mod edit;
 mod help;
 mod quick;
+mod settings;
 mod syntax;
 mod theme;
 mod titlebar;
 
 use edit::ed;
 use titlebar::Hit;
-use std::{cell::RefCell, mem::zeroed, path::PathBuf, ptr::{null, null_mut}, sync::atomic::{AtomicU32, Ordering::Relaxed}, time::SystemTime};
+use std::{cell::RefCell, ffi::c_void, mem::zeroed, path::PathBuf, ptr::{null, null_mut}, sync::atomic::{AtomicU32, Ordering::Relaxed}, time::SystemTime};
 use windows_sys::{
+    core::{GUID, HRESULT},
     w,
     Win32::{
         Foundation::*,
@@ -18,6 +20,7 @@ use windows_sys::{
         Graphics::Gdi::*,
         Graphics::Dwm::DwmSetWindowAttribute,
         System::{
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
             DataExchange::COPYDATASTRUCT,
             LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
             Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
@@ -58,6 +61,9 @@ const ID_MOVEDOWN: u16 = 21;
 const ID_ZOOMRESET: u16 = 22;
 const ID_HELP: u16 = 23;
 const ID_QUICKOPEN: u16 = 24;
+const ID_SCHEME: u16 = 25;
+const ID_SETTINGS_UI: u16 = 26;
+const ID_NEWWINDOW: u16 = 27;
 const MAX_CLOSED: usize = 50;
 const TIMER_FILES: usize = 1; // look for files changed by other programs
 const TIMER_SESSION: usize = 2; // save the session shortly after a change
@@ -82,6 +88,8 @@ word_wrap = false
 auto_close = true
 # system, light or dark
 theme = system
+# one of the schemes in Settings > Color Scheme (Ctrl+K Ctrl+T)
+color_scheme = Visual Studio
 # number of recently opened files offered by Ctrl+P
 recent_files = 20
 ";
@@ -163,6 +171,8 @@ struct State {
     dpi: u32,
     face: String,
     theme: String, // "system", "light" or "dark"
+    scheme: String, // color scheme name
+    preview: Option<String>, // scheme shown while choosing one
     size: i32,  // font size from the settings file
     pt: i32,    // current font size, changed by Ctrl+wheel
     wheel: i32, // accumulated Ctrl+wheel delta, for high-resolution wheels and touchpads
@@ -176,7 +186,7 @@ thread_local! {
     static S: RefCell<State> = const { RefCell::new(State {
         win: Win::new(null_mut()), parked: Vec::new(), menu: null_mut(), efont: null_mut(), ufont: null_mut(), ifont: null_mut(), ifont_small: null_mut(),
         checking: false, goto: None, closed: Vec::new(), incoming: Vec::new(), later: Vec::new(), recent: Vec::new(), max_recent: 20, quick: Vec::new(),
-        dpi: 96, face: String::new(), theme: String::new(), size: 11, pt: 11, wheel: 0, opts: edit::Options { tab_width: 4, use_spaces: false, line_numbers: true, highlight_line: true, margin: 8, word_wrap: false, auto_close: true },
+        dpi: 96, face: String::new(), theme: String::new(), scheme: String::new(), preview: None, size: 11, pt: 11, wheel: 0, opts: edit::Options { tab_width: 4, use_spaces: false, line_numbers: true, highlight_line: true, margin: 8, word_wrap: false, auto_close: true },
         fdlg: null_mut(), fdlg_title: String::new(), fr: null_mut(),
     }) };
 }
@@ -255,7 +265,7 @@ fn yes(v: &str) -> bool {
 fn load_settings() {
     let text = settings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     with(|s| {
-        (s.face, s.size, s.theme) = ("Consolas".into(), 11, "system".into());
+        (s.face, s.size, s.theme, s.scheme) = ("Consolas".into(), 11, "system".into(), theme::SCHEMES[0].name.into());
         for line in DEFAULT_SETTINGS.lines().chain(text.lines()) {
             let Some((k, v)) = line.split_once('=').filter(|_| !line.trim_start().starts_with('#')) else { continue };
             match (k.trim(), v.trim()) {
@@ -268,6 +278,7 @@ fn load_settings() {
                 ("word_wrap", v) => s.opts.word_wrap = yes(v),
                 ("auto_close", v) => s.opts.auto_close = yes(v),
                 ("theme", v) => s.theme = v.to_ascii_lowercase(),
+                ("color_scheme", v) => s.scheme = theme::find(v).name.into(),
                 ("recent_files", v) => s.max_recent = v.parse().map_or(s.max_recent, |n: usize| n.min(500)),
                 ("margin", v) => s.opts.margin = v.parse().map_or(s.opts.margin, |n: i32| n.clamp(0, 100)),
                 _ => {}
@@ -278,6 +289,33 @@ fn load_settings() {
 }
 
 /// Opens settings.ini in a tab, first adding any options it does not list yet.
+/// Ctrl+,: the settings window.
+unsafe fn open_settings_ui() {
+    let (main, font, dpi, values) = with(|s| {
+        let o = &s.opts;
+        let values = settings::Values {
+            face: s.face.clone(), size: s.size, theme: s.theme.clone(), scheme: s.scheme.clone(), tab_width: o.tab_width,
+            use_spaces: o.use_spaces, word_wrap: o.word_wrap, line_numbers: o.line_numbers, highlight_line: o.highlight_line,
+            auto_close: o.auto_close, margin: o.margin, recent: s.max_recent,
+        };
+        (s.win.main, s.ufont, s.dpi, values)
+    });
+    settings::show(main, values, font, dpi, setting_changed);
+}
+
+/// A change in the settings window: store it in settings.ini and apply it everywhere.
+unsafe fn setting_changed(key: &str, value: &str) {
+    set_setting(key, value);
+    let pt = with(|s| s.pt);
+    load_settings();
+    if key != "size" {
+        with(|s| s.pt = pt); // keep the Ctrl+wheel zoom unless the size itself changed
+    }
+    with(|s| s.recent.truncate(s.max_recent));
+    set_fonts();
+    schedule_save();
+}
+
 unsafe fn open_settings() {
     let Some(p) = settings_path() else { return };
     let mut text = std::fs::read_to_string(&p).unwrap_or_default();
@@ -367,9 +405,10 @@ unsafe fn system_dark() -> bool {
 
 /// Applies the light or dark palette to everything, including the parts Windows draws.
 unsafe fn apply_theme() {
-    let (windows, setting, edits) = with(|s| (all_windows(s), s.theme.clone(), all_edits(s)));
-    let dark = theme_is_dark(&setting, system_dark());
-    theme::set_dark(dark);
+    let (windows, setting, scheme, edits) = with(|s| (all_windows(s), s.theme.clone(), s.preview.clone().unwrap_or(s.scheme.clone()), all_edits(s)));
+    theme::apply(&scheme, theme_is_dark(&setting, system_dark()));
+    // Native parts follow the actual colors: a dark-only scheme stays dark in light mode.
+    let dark = theme::is_dark();
     let flag = dark as i32;
     for &w in &windows {
         DwmSetWindowAttribute(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &flag as *const _ as _, 4);
@@ -380,6 +419,7 @@ unsafe fn apply_theme() {
         theme_editor(e);
         InvalidateRect(e, null(), 0);
     }
+    settings::recolor();
 }
 
 fn all_windows(s: &State) -> Vec<HWND> {
@@ -495,6 +535,56 @@ unsafe fn tear_off(i: usize, pt: POINT) {
     SetWindowPos(new, null_mut(), pt.x - 120, pt.y - 16, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
     move_tab(i, new, None);
     ShowWindow(new, SW_SHOW);
+}
+
+/// Opens a window with one empty tab, sized like window `like`; returns it.
+unsafe fn new_window(like: HWND) -> HWND {
+    let mut wp: WINDOWPLACEMENT = zeroed();
+    wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+    GetWindowPlacement(like, &mut wp);
+    let rc = wp.rcNormalPosition;
+    let new = create_window(); // the system cascades it on the current monitor and virtual desktop
+    SetWindowPos(new, null_mut(), 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    let prev = enter(new);
+    new_tab();
+    leave(prev);
+    ShowWindow(new, SW_SHOW);
+    schedule_save();
+    new
+}
+
+/// True if `h` is on the current virtual desktop (or that cannot be told).
+unsafe fn on_current_desktop(h: HWND) -> bool {
+    // IVirtualDesktopManager by hand: windows-sys has no COM interface wrappers.
+    const CLSID: GUID = GUID::from_u128(0xaa509086_5ca9_4c25_8f95_589d3c07b48a);
+    const IID: GUID = GUID::from_u128(0xa5cd92ff_29be_454c_8d04_d82879fb3f1b);
+    type IsOnCurrent = unsafe extern "system" fn(*mut c_void, HWND, *mut BOOL) -> HRESULT;
+    type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+    let mut obj: *mut c_void = null_mut();
+    if CoCreateInstance(&CLSID, null_mut(), CLSCTX_INPROC_SERVER, &IID, &mut obj) != 0 || obj.is_null() {
+        return true;
+    }
+    let vtable = *(obj as *const *const usize);
+    let mut on = 1;
+    let ok = std::mem::transmute::<usize, IsOnCurrent>(*vtable.add(3))(obj, h, &mut on) == 0;
+    std::mem::transmute::<usize, Release>(*vtable.add(2))(obj);
+    !ok || on != 0
+}
+
+/// Where another launch's files go: our frontmost window on the current virtual desktop, else a new window.
+/// Without files, the launch asks for a new window (e.g. middle-click on the taskbar button).
+unsafe fn launch_target(h: HWND, files: bool) -> HWND {
+    if files {
+        let class = wide(&instance_name());
+        let mut w = FindWindowExW(null_mut(), null_mut(), class.as_ptr(), null());
+        while !w.is_null() {
+            if IsWindowVisible(w) != 0 && on_current_desktop(w) {
+                return w;
+            }
+            w = FindWindowExW(null_mut(), w, class.as_ptr(), null());
+        }
+    }
+    new_window(h)
 }
 
 /// Scrolls the tab bar so tab `i` is fully visible.
@@ -804,7 +894,9 @@ unsafe fn hand_over(class: &[u16], paths: &[PathBuf]) -> bool {
         if !h.is_null() {
             let data = encode_paths(paths);
             let cds = COPYDATASTRUCT { dwData: COPYDATA_OPEN, cbData: (data.len() * 2) as u32, lpData: data.as_ptr() as _ };
-            SendMessageW(h, WM_COPYDATA, 0, &cds as *const _ as LPARAM);
+            // The window to show: a new one or the one receiving the files (older versions return 1).
+            let target = SendMessageW(h, WM_COPYDATA, 0, &cds as *const _ as LPARAM) as HWND;
+            let h = if IsWindow(target) != 0 { target } else { h };
             if IsIconic(h) != 0 {
                 ShowWindow(h, SW_RESTORE);
             }
@@ -1307,7 +1399,7 @@ unsafe fn quick_open() {
         (items, picks, s.win.main, s.ufont, s.dpi)
     });
     with(|s| s.quick = picks);
-    quick::show(main, items, font, dpi, bar_rects().height, quick_pick);
+    quick::show(main, items, quick::Opts { font, dpi, top: bar_rects().height, pick: quick_pick, preview: None, cancel: None, selected: 0 });
 }
 
 unsafe fn quick_pick(i: usize) {
@@ -1316,6 +1408,63 @@ unsafe fn quick_pick(i: usize) {
         Some(Pick::File(f)) => open_path(f),
         None => {}
     }
+}
+
+/// Ctrl+K Ctrl+T: the color schemes, previewed live while moving through the list.
+unsafe fn choose_scheme() {
+    let items = theme::SCHEMES.iter().map(|s| quick::Item {
+        name: s.name.into(),
+        dir: match (s.dark.is_some(), s.light.is_some()) {
+            (true, true) => "dark + light".into(),
+            (true, false) => "dark only".into(),
+            _ => "light only".into(),
+        },
+        open: false,
+    }).collect();
+    let (main, font, dpi, current) = with(|s| (s.win.main, s.ufont, s.dpi, s.scheme.clone()));
+    let selected = theme::SCHEMES.iter().position(|s| s.name == current).unwrap_or(0);
+    quick::show(main, items, quick::Opts {
+        font, dpi, top: bar_rects().height, pick: scheme_pick, preview: Some(scheme_preview), cancel: Some(scheme_cancel), selected,
+    });
+}
+
+unsafe fn scheme_preview(i: usize) {
+    with(|s| s.preview = Some(theme::SCHEMES[i].name.into()));
+    apply_theme();
+    quick::recolor();
+}
+
+unsafe fn scheme_cancel() {
+    with(|s| s.preview = None);
+    apply_theme();
+}
+
+unsafe fn scheme_pick(i: usize) {
+    let name = theme::SCHEMES[i].name;
+    with(|s| (s.preview, s.scheme) = (None, name.into()));
+    set_setting("color_scheme", name);
+    apply_theme();
+}
+
+/// Writes one `key = value` into settings.ini (replacing the line or adding it).
+fn set_setting(key: &str, value: &str) {
+    let Some(p) = settings_path() else { return };
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| DEFAULT_SETTINGS.into());
+    let mut found = false;
+    let mut out: Vec<String> = text.lines().map(|l| {
+        let is_key = !l.trim_start().starts_with('#') && l.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+        if is_key && !found {
+            found = true;
+            format!("{key} = {value}")
+        } else {
+            l.to_string()
+        }
+    }).collect();
+    if !found {
+        out.push(format!("{key} = {value}"));
+    }
+    _ = std::fs::create_dir_all(p.parent().unwrap());
+    _ = std::fs::write(&p, out.join("\n") + "\n");
 }
 
 /// Brings window `w` to the front with the tab of editor `e`.
@@ -1707,10 +1856,12 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 return 0;
             }
             let data = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
-            with(|s| s.incoming.extend(decode_paths(data)));
+            let paths = decode_paths(data);
+            let target = launch_target(h, !paths.is_empty());
+            with(|s| s.incoming.extend(paths));
             // Open after returning, so an error message cannot block the sending launch.
-            PostMessageW(h, WM_OPEN_INCOMING, 0, 0);
-            1
+            PostMessageW(target, WM_OPEN_INCOMING, 0, 0);
+            target as LRESULT // the launch brings it to the front
         }
         WM_OPEN_INCOMING => {
             for p in with(|s| std::mem::take(&mut s.incoming)) {
@@ -1919,6 +2070,7 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let (cur, n) = with(|s| (s.win.cur, s.win.tabs.len()));
             match id {
                 ID_NEW => new_tab(),
+                ID_NEWWINDOW => _ = new_window(h),
                 ID_OPEN => file_dialog(false, None).into_iter().for_each(|p| open_path(p)),
                 ID_SAVE => _ = save(cur, false),
                 ID_SAVEAS => _ = save(cur, true),
@@ -1938,6 +2090,8 @@ unsafe fn window_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 ID_GOTO => go_to_line(),
                 ID_HELP => help::toggle(h, with(|s| s.dpi)),
                 ID_QUICKOPEN => quick_open(),
+                ID_SCHEME => choose_scheme(),
+                ID_SETTINGS_UI => open_settings_ui(),
                 ID_ZOOMRESET => {
                     with(|s| s.pt = s.size);
                     set_fonts();
@@ -2027,6 +2181,7 @@ fn accelerators() -> Vec<ACCEL> {
     let mut accels = vec![
         ACCEL { fVirt: c, key: b'T' as u16, cmd: ID_NEW },
         ACCEL { fVirt: c, key: b'N' as u16, cmd: ID_NEW },
+        ACCEL { fVirt: cs, key: b'N' as u16, cmd: ID_NEWWINDOW },
         ACCEL { fVirt: c, key: b'O' as u16, cmd: ID_OPEN },
         ACCEL { fVirt: c, key: b'S' as u16, cmd: ID_SAVE },
         ACCEL { fVirt: cs, key: b'S' as u16, cmd: ID_SAVEAS },
@@ -2039,6 +2194,7 @@ fn accelerators() -> Vec<ACCEL> {
         ACCEL { fVirt: FALT | FVIRTKEY, key: b'Z' as u16, cmd: ID_WRAP },
         ACCEL { fVirt: c, key: b'G' as u16, cmd: ID_GOTO },
         ACCEL { fVirt: c, key: b'P' as u16, cmd: ID_QUICKOPEN },
+        ACCEL { fVirt: c, key: VK_OEM_COMMA, cmd: ID_SETTINGS_UI },
         ACCEL { fVirt: c, key: b'0' as u16, cmd: ID_ZOOMRESET },
         ACCEL { fVirt: c, key: VK_NUMPAD0, cmd: ID_ZOOMRESET },
         ACCEL { fVirt: c, key: VK_TAB, cmd: ID_NEXT },
@@ -2065,6 +2221,7 @@ fn accel_name(a: &ACCEL) -> String {
         VK_PRIOR => "PgUp".into(),
         VK_F3 => "F3".into(),
         VK_NUMPAD0 => "Num0".into(),
+        VK_OEM_COMMA => ",".into(),
         k => char::from(k as u8).to_string(),
     }
 }
@@ -2078,7 +2235,16 @@ fn main() {
             let p = PathBuf::from(p);
             std::path::absolute(&p).unwrap_or(p)
         }).collect();
-        // One window per user: a second launch hands its files to the first one.
+        // Release builds abort on a panic without a message; keep it in crash.log.
+        std::panic::set_hook(Box::new(|info| {
+            if let Some(p) = app_dir().map(|d| d.join("crash.log")) {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p);
+                _ = f.as_mut().map(|f| writeln!(f, "{:?}: {info}", SystemTime::now()));
+            }
+        }));
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+        // One process per user: a second launch hands its files (or a request for a new window) to the first one.
         CreateMutexW(null(), 0, wide(&format!("Local\\{}", instance_name())).as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS && hand_over(&class, &args) {
             return;
@@ -2102,6 +2268,7 @@ fn main() {
         for (title, items) in [
             ("&File", &[
                 (ID_NEW, "&New Tab\tCtrl+T"),
+                (ID_NEWWINDOW, "New &Window\tCtrl+Shift+N"),
                 (ID_OPEN, "&Open...\tCtrl+O"),
                 (ID_QUICKOPEN, "&Quick Open...\tCtrl+P"),
                 (ID_SAVE, "&Save\tCtrl+S"),
@@ -2138,7 +2305,11 @@ fn main() {
             }
             AppendMenuW(bar, MF_POPUP, popup as usize, wide(title).as_ptr());
         }
-        AppendMenuW(bar, MF_STRING, ID_SETTINGS as usize, w!("&Settings"));
+        let settings = CreatePopupMenu();
+        AppendMenuW(settings, MF_STRING, ID_SETTINGS_UI as usize, w!("&Settings...\tCtrl+,"));
+        AppendMenuW(settings, MF_STRING, ID_SETTINGS as usize, w!("Settings &File"));
+        AppendMenuW(settings, MF_STRING, ID_SCHEME as usize, w!("&Color Scheme...\tCtrl+K Ctrl+T"));
+        AppendMenuW(bar, MF_POPUP, settings as usize, w!("&Settings"));
         with(|s| s.menu = bar);
         FINDMSG.store(RegisterWindowMessageW(FINDMSGSTRINGW), Relaxed);
 
@@ -2174,10 +2345,28 @@ fn main() {
         }
 
         let mut msg: MSG = zeroed();
+        let mut chord = false; // Ctrl+K was pressed
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            let settings_window = settings::window();
+            if !settings_window.is_null() && IsDialogMessageW(settings_window, &msg) != 0 {
+                continue;
+            }
             let dlg = with(|s| s.fdlg);
             if !dlg.is_null() && IsDialogMessageW(dlg, &msg) != 0 {
                 continue;
+            }
+            // Ctrl+K Ctrl+T (a chord, as in VS Code): the color scheme picker.
+            if msg.message == WM_KEYDOWN && !matches!(msg.wParam as VIRTUAL_KEY, VK_CONTROL | VK_SHIFT | VK_MENU) {
+                let ctrl = GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_SHIFT as i32) >= 0;
+                if std::mem::take(&mut chord) {
+                    if ctrl && msg.wParam == b'T' as usize {
+                        choose_scheme();
+                        continue;
+                    }
+                } else if ctrl && msg.wParam == b'K' as usize {
+                    chord = true;
+                    continue;
+                }
             }
             // Ctrl+/ (whatever key types '/') toggles the shortcut overview.
             if GetKeyState(VK_CONTROL as i32) < 0 && help::is_slash(&msg) {
